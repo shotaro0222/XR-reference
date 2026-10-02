@@ -19,7 +19,18 @@ const NEWS_FEEDS = {
 
 async function fetchNewsArticles(url: string, limit: number = 3) {
   try {
-    const response = await fetch(url);
+    // Yahoo RSS対策としてUser-Agentを指定
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    });
+
+    if (!response.ok) {
+      console.error(`RSS Fetch failed for ${url}: Status ${response.status}`);
+      return [];
+    }
+
     const xml = await response.text();
     const articles = [];
     const itemRegex = /<item>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<link>(.*?)<\/link>[\s\S]*?<\/item>/g;
@@ -27,27 +38,41 @@ async function fetchNewsArticles(url: string, limit: number = 3) {
     let count = 0;
     
     while ((match = itemRegex.exec(xml)) !== null && count < limit) {
-      // XMLエンティティの簡易デコード
-      const title = match[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+      const title = match[1]
+        .replace(/<!\[CDATA\[/g, '')         .replace(/\]\]>/g, '')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>');
       articles.push({ title, url: match[2] });
       count++;
     }
     return articles;
   } catch (error) {
+    console.error(`Error fetching RSS from ${url}:`, error);
     return [];
   }
 }
 
-export default {
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+async function getOrRefreshNews(env: Env, forceRefresh: boolean = false) {
+  let cachedNews = await env.NEWS_KV.get("daily_news");
+  
+  if (!cachedNews || forceRefresh) {
     const newsData: Record<string, any> = {};
     await Promise.all(
-      Object.entries(NEWS_FEEDS).map(async ([category, url]) => {
-        newsData[category] = await fetchNewsArticles(url, 3);
+      Object.entries(NEWS_FEEDS).map(async ([category, feedUrl]) => {
+        newsData[category] = await fetchNewsArticles(feedUrl, 3);
       })
     );
     newsData["last_updated"] = new Date().toISOString();
-    await env.NEWS_KV.put("daily_news", JSON.stringify(newsData));
+    cachedNews = JSON.stringify(newsData);
+    await env.NEWS_KV.put("daily_news", cachedNews);
+  }
+  return cachedNews;
+}
+
+export default {
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    await getOrRefreshNews(env, true);
   },
 
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -57,29 +82,24 @@ export default {
 
     const url = new URL(request.url);
 
-    // デバッグ・手動更新兼用のエンドポイント
+    // ニュース取得・手動更新API
     if (request.method === "GET" && (url.pathname === "/api/news" || url.pathname === "/api/refresh-news")) {
-      let cachedNews = await env.NEWS_KV.get("daily_news");
-      
-      // KVにデータがない、または強制リフレッシュしたい場合はその場で取得して保存
-      if (!cachedNews || url.pathname === "/api/refresh-news") {
-        const newsData: Record<string, any> = {};
-        await Promise.all(
-          Object.entries(NEWS_FEEDS).map(async ([category, feedUrl]) => {
-            newsData[category] = await fetchNewsArticles(feedUrl, 3);
-          })
-        );
-        newsData["last_updated"] = new Date().toISOString();
-        cachedNews = JSON.stringify(newsData);
-        await env.NEWS_KV.put("daily_news", cachedNews);
+      try {
+        const forceRefresh = url.pathname === "/api/refresh-news";
+        const newsJson = await getOrRefreshNews(env, forceRefresh);
+        
+        return new Response(newsJson, { 
+          headers: { ...corsHeaders, "Content-Type": "application/json" } 
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: "Failed to load news", details: err?.message }), {
+          status: 500,
+          headers: corsHeaders
+        });
       }
-
-      return new Response(cachedNews, { 
-        headers: { ...corsHeaders, "Content-Type": "application/json" } 
-      });
     }
 
-    // AR生成エンドポイント
+    // AR生成API
     if (request.method === "POST" && url.pathname === "/api/generate") {
       try {
         const { keyword, mode } = await request.json() as { keyword: string, mode: '2.5d' | '3d' };
