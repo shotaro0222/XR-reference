@@ -1,12 +1,21 @@
-name = "ar-generator-api"
+name = "xr-reference"
 main = "src/index.ts"
 compatibility_date = "2024-03-20"
 
-# Workers AIのバインディング
+# AIとR2 (前回までの設定)
 [ai]
 binding = "AI"
 
-# R2ストレージのバインディング
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "ar-assets-bucket"
+
+# --- 今回追加 ---
+# ニュース保存用のKVストレージ
+[[kv_namespaces]]
+binding = "NEWS_KV"
+id = "YOUR_KV_NAMESPACE_ID" # 後述のコマンドで取得したIDを入れる
+
+# 毎日朝6:00 (JST) / 21:00 (UTC) に自動取得を実行
+[triggers]
+crons = ["0 21 * * *"]

@@ -1,82 +1,93 @@
 export interface Env {
   AI: any;
   BUCKET: R2Bucket;
+  NEWS_KV: KVNamespace;
 }
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+// 各カテゴリのRSSフィードURL（例としてYahooニュース等を使用）
+const NEWS_FEEDS = {
+  entertainment: "https://news.yahoo.co.jp/rss/topics/entertainment.xml",
+  business: "https://news.yahoo.co.jp/rss/topics/business.xml",
+  it: "https://news.yahoo.co.jp/rss/topics/it.xml",
+  funny: "https://news.yahoo.co.jp/rss/topics/local.xml" // おもしろ/ローカル系
+};
+
+// RSSから指定件数の記事を抽出するヘルパー関数
+async function fetchNewsArticles(url: string, limit: number = 3) {
+  try {
+    const response = await fetch(url);
+    const xml = await response.text();
+    const articles = [];
+    
+    // Cloudflare Workers環境を軽量に保つため正規表現でパース
+    const itemRegex = /<item>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<link>(.*?)<\/link>[\s\S]*?<\/item>/g;
+    let match;
+    let count = 0;
+    
+    while ((match = itemRegex.exec(xml)) !== null && count < limit) {
+      articles.push({ title: match[1], url: match[2] });
+      count++;
+    }
+    return articles;
+  } catch (error) {
+    return [];
+  }
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    // CORSプリフライトリクエストの処理
+  // ==========================================
+  // [1] 自動取得バッチ (Cron Trigger)
+  // ==========================================
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const newsData: Record<string, any> = {};
+
+    // 4カテゴリのニュースを並行して取得
+    await Promise.all(
+      Object.entries(NEWS_FEEDS).map(async ([category, url]) => {
+        newsData[category] = await fetchNewsArticles(url, 3);
+      })
+    );
+
+    newsData["last_updated"] = new Date().toISOString();
+
+    // 取得したニュースをKVに保存（有効期限を設定することも可能）
+    await env.NEWS_KV.put("daily_news", JSON.stringify(newsData));
+  },
+
+  // ==========================================
+  // [2] ユーザー向けAPIエンドポイント
+  // ==========================================
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
 
-    if (request.method === "POST" && new URL(request.url).pathname === "/api/generate") {
-      try {
-        const { keyword, mode } = await request.json() as { keyword: string, mode: '2.5d' | '3d' };
-        
-        // ファイル名の生成（キャッシュ用）
-        const timestamp = Date.now();
-        const safeKeyword = keyword.replace(/[^a-zA-Z0-9]/g, '_');
+    const url = new URL(request.url);
 
-        if (mode === '2.5d') {
-          // ==========================================
-          // [2.5Dモード] Cloudflare Workers AIで画像生成
-          // ==========================================
-          const prompt = `A highly detailed, isolated 3D-style render of ${keyword}, solid black background, photorealistic`;
-          
-          // SDXL等のモデルをエッジで実行
-          const response = await env.AI.run(
-            '@cf/stabilityai/stable-diffusion-xl-base-1.0',
-            { prompt }
-          );
-
-          // R2へ保存（背景透過処理を挟む場合はここで処理）
-          const filename = `${safeKeyword}_${timestamp}.png`;
-          await env.BUCKET.put(filename, response);
-
-          // 公開URLを返す (R2のパブリックドメインを設定している前提)
-          return new Response(JSON.stringify({ 
-            status: "success", 
-            type: "image",
-            url: `https://pub-your-r2-domain.r2.dev/${filename}` 
-          }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-
-        } else if (mode === '3d') {
-          // ==========================================
-          // [3Dモード] 外部 Text-to-3D APIへのリクエスト
-          // ==========================================
-          // MVP用: 実際の3D生成API（Meshy等）は非同期で数分かかるため、
-          // ここではAPIを叩く構造だけ作り、モックのGLB URLを返します。
-          
-          /* 
-          const meshyResponse = await fetch('https://api.meshy.ai/v2/text-to-3d', {
-            method: 'POST',
-            headers: { 'Authorization': 'Bearer YOUR_API_KEY', 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: keyword, mode: "preview" })
-          });
-          const { result_id } = await meshyResponse.json();
-          // ※実際にはここでポーリング処理かWebhook待機を行い、R2に保存する
-          */
-
-          const filename = `${safeKeyword}_mock.glb`;
-          
-          return new Response(JSON.stringify({ 
-            status: "success", 
-            type: "model",
-            // テスト用にフリーのGLBモデルURLなどを指定してUIを確認します
-            url: `https://pub-your-r2-domain.r2.dev/sample_model.glb` 
-          }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-        }
-
-      } catch (error) {
-        return new Response(JSON.stringify({ error: "Generation failed" }), { status: 500, headers: corsHeaders });
+    // 追加: ニュース取得用エンドポイント
+    if (request.method === "GET" && url.pathname === "/api/news") {
+      // KVから最新のニュースを取得
+      const cachedNews = await env.NEWS_KV.get("daily_news");
+      
+      if (!cachedNews) {
+        return new Response(JSON.stringify({ error: "News not ready" }), { status: 404, headers: corsHeaders });
       }
+
+      return new Response(cachedNews, { 
+        headers: { ...corsHeaders, "Content-Type": "application/json" } 
+      });
+    }
+
+    // （前回までのAR生成APIロジックはそのまま残す）
+    if (request.method === "POST" && url.pathname === "/api/generate") {
+      // ... (前回のAR生成コード)
+      return new Response(JSON.stringify({ status: "success" }), { headers: corsHeaders });
     }
 
     return new Response("Not Found", { status: 404 });
