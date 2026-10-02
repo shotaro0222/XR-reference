@@ -70,6 +70,22 @@ export default {
 
     const url = new URL(request.url);
 
+    // fetch関数内に追加
+if (request.method === "GET" && url.pathname === "/api/refresh-news") {
+  const newsData: Record<string, any> = {};
+  await Promise.all(
+    Object.entries(NEWS_FEEDS).map(async ([category, url]) => {
+      newsData[category] = await fetchNewsArticles(url, 3);
+    })
+  );
+  newsData["last_updated"] = new Date().toISOString();
+  await env.NEWS_KV.put("daily_news", JSON.stringify(newsData));
+  
+  return new Response(JSON.stringify({ status: "Refreshed successfully!", newsData }), {
+    headers: { ...corsHeaders, "Content-Type": "application/json" }
+  });
+}
+
     // 追加: ニュース取得用エンドポイント
     if (request.method === "GET" && url.pathname === "/api/news") {
       // KVから最新のニュースを取得
