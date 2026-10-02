@@ -14,7 +14,7 @@ bucket_name = "ar-assets-bucket"
 # ニュース保存用のKVストレージ
 [[kv_namespaces]]
 binding = "NEWS_KV"
-id = "YOUR_KV_NAMESPACE_ID" # 後述のコマンドで取得したIDを入れる
+id = "ac465d82796a476ea2e299bcc6a0c278" # 後述のコマンドで取得したIDを入れる
 
 # 毎日朝6:00 (JST) / 21:00 (UTC) に自動取得を実行
 [triggers]
