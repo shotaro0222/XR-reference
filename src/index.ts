@@ -19,15 +19,7 @@ const NEWS_FEEDS = {
 
 async function fetchNewsArticles(url: string, limit: number = 3) {
   try {
-    // 【修正箇所】Yahoo側からBotとして弾かれないようにUser-Agentを付与
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-      }
-    });
-    
-    if (!response.ok) return [];
-
+    const response = await fetch(url);
     const xml = await response.text();
     const articles = [];
     const itemRegex = /<item>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<link>(.*?)<\/link>[\s\S]*?<\/item>/g;
@@ -92,9 +84,7 @@ export default {
       try {
         const { keyword, mode } = await request.json() as { keyword: string, mode: '2.5d' | '3d' };
         const timestamp = Date.now();
-        
-        // 【修正箇所】日本語キーワードでもファイル名としてR2に保存できるようにエンコード処理を追加
-        const safeKeyword = encodeURIComponent(keyword).replace(/[^a-zA-Z0-9_-]/g, '');
+        const safeKeyword = keyword.replace(/[^a-zA-Z0-9]/g, '_');
 
         if (mode === '2.5d') {
           const prompt = `A highly detailed, isolated 3D-style render of ${keyword}, solid black background, photorealistic`;
@@ -106,30 +96,14 @@ export default {
           return new Response(JSON.stringify({ 
             status: "success", 
             type: "image",
-            // ★以下のURLをR2のパブリックURL（またはカスタムドメイン）に変更してください★
             url: `https://pub-your-r2-domain.r2.dev/${filename}` 
           }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-          
-        } else if (mode === '3d') {
-          // 【修正箇所】未実装の3Dモードがリクエストされた場合でもフロントエンドがフリーズしないようにエラーを返す
-          return new Response(JSON.stringify({ error: "3D mode is not implemented yet" }), { 
-            status: 400, 
-            headers: { ...corsHeaders, "Content-Type": "application/json" } 
-          });
         }
       } catch (error) {
-        // 【修正箇所】エラー時にもCORSヘッダーを返す（フロントエンドで詳細なエラーを拾うため）
-        return new Response(JSON.stringify({ error: "Generation failed" }), { 
-          status: 500, 
-          headers: { ...corsHeaders, "Content-Type": "application/json" } 
-        });
+        return new Response(JSON.stringify({ error: "Generation failed" }), { status: 500, headers: corsHeaders });
       }
     }
 
-    // 【修正箇所】404エラー時にもCORSヘッダーを返す
-    return new Response(JSON.stringify({ error: "Not Found" }), { 
-      status: 404,
-      headers: { ...corsHeaders, "Content-Type": "application/json" } 
-    });
+    return new Response("Not Found", { status: 404 });
   }
 };
