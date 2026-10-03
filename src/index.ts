@@ -1,16 +1,26 @@
 // News Summoner backend (Cloudflare Workers)
-// - Cron（JST 5:00 / 17:00）で各メディアの公式RSSを取得し、タイトル・リンク・要約(summary)をKVに保存
-// - 要約はRSSが配信している記事概要(description)を使用。長いものだけWorkers AIで読み上げ用に短く整える
-// - /api/news でフロントに配信
+//
+// 1. Cron（JST 5:00 / 17:00）で各メディアの公式RSSから「記事一覧（タイトル・記事URL・概要）」を取得して KV に保存
+// 2. 各記事ページを取得して本文を抜き出し、Workers AI で読み上げ用の要約を作って KV にキャッシュ
+//    - robots.txt で禁止されているページは取得しない
+//    - 1回の処理で取得する記事数を絞り、残りはアクセスのたびに少しずつ裏で作る（無料枠の制限対策）
+// 3. /api/news       … 記事一覧（作成済みのAI要約を合成して返す）
+//    /api/summary    … 1記事のAI要約（未作成ならその場で作る）
 
-const DATA_VERSION = 2;
-const MAX_ITEMS = 6;
-const SUMMARY_MAX = 220; // これを超える概要はAIで短く整える（失敗時は文単位で切り詰め）
-const MAX_AI_CALLS = 12; // 1回のCronでAIを呼ぶ上限
+const DATA_VERSION = 3;
+const MAX_ITEMS = 6; // 1カテゴリに表示する件数
+const CANDIDATES = 10; // 1カテゴリで候補にする件数（中身が取れない記事を除外するため多めに）
+const SUMMARY_MAX = 320;
+const WARM_ON_CRON = 10; // Cron 1回で作るAI要約の上限
+const WARM_ON_REQUEST = 2; // /api/news 1回で裏で作るAI要約の上限
+const SUMMARY_TTL = 60 * 60 * 24 * 7; // 要約キャッシュ 7日
+const FAIL_TTL = 60 * 60 * 6; // 取得失敗は6時間は再挑戦しない
+const ROBOTS_TTL = 60 * 60 * 24;
 const DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
-const UA = 'Mozilla/5.0 (compatible; NewsSummoner/2.0; +https://github.com/shotaro0222/XR-reference)';
+const UA_TOKEN = 'NewsSummoner';
+const UA = `Mozilla/5.0 (compatible; ${UA_TOKEN}/3.0; +https://github.com/shotaro0222/XR-reference)`;
 
-// カテゴリごとのRSS。上から順に試して、要約付きの記事が取れた最初のフィードを採用する
+// カテゴリごとのRSS。上から順に、中身のある記事が MAX_ITEMS 件そろうまで使う
 const FEEDS: Record<string, string[]> = {
   it: ['https://rss.itmedia.co.jp/rss/2.0/news_bursts.xml'],
   business: ['https://rss.itmedia.co.jp/rss/2.0/business.xml'],
@@ -23,13 +33,21 @@ const FEEDS: Record<string, string[]> = {
   funny: ['https://gigazine.net/news/rss_2.0/', 'https://rss.itmedia.co.jp/rss/2.0/netlab.xml']
 };
 
-export type NewsItem = { title: string; url: string; summary?: string; source?: string; published?: string };
+export type NewsItem = {
+  title: string;
+  url: string; // 記事そのもののURL（トップページではない）
+  summary?: string; // 読み上げる中身（AI要約 > RSS概要）
+  summaryKind?: 'ai' | 'rss';
+  source?: string;
+  published?: string;
+};
+type SummaryRecord = { summary?: string; failed?: boolean; at: string };
 
-// ---------- RSS パース ----------
+// ====================== テキスト処理 ======================
 export function decodeEntities(s: string): string {
   return s
-    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => safeCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => safeCodePoint(parseInt(d, 10)))
     .replace(/&nbsp;/g, ' ')
     .replace(/&hellip;/g, '…')
     .replace(/&quot;/g, '"')
@@ -38,10 +56,13 @@ export function decodeEntities(s: string): string {
     .replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&');
 }
+function safeCodePoint(n: number) {
+  try { return String.fromCodePoint(n); } catch { return ''; }
+}
 
 export function cleanText(s = ''): string {
   let t = s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1');
-  t = decodeEntities(t); // エスケープされたHTMLを戻してからタグを除去
+  t = decodeEntities(t);
   t = t
     .replace(/<(script|style)[\s\S]*?<\/\1>/gi, '')
     .replace(/<br\s*\/?>/gi, ' ')
@@ -51,13 +72,30 @@ export function cleanText(s = ''): string {
   return decodeEntities(t);
 }
 
+const hasJapanese = (s: string) => /[ぁ-んァ-ヶ一-龠]/.test(s);
+
+export function truncateSentences(text: string, maxLen = SUMMARY_MAX): string {
+  if (text.length <= maxLen) return text;
+  const sentences = text.match(/[^。！？!?]+[。！？!?」』）)]*/g) || [text];
+  let out = '';
+  for (const s of sentences) {
+    if ((out + s).length > maxLen) break;
+    out += s;
+  }
+  return (out || text.slice(0, maxLen - 1) + '…').trim();
+}
+
+// ====================== RSS ======================
 function tag(block: string, name: string): string {
   const m = block.match(new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${name}>`, 'i'));
   return m ? m[1] : '';
 }
 
 export function parseFeed(xml: string): { source: string; items: NewsItem[] } {
-  const channel = xml.match(/<channel[\s>][\s\S]*?(?=<item[\s>]|<\/channel>)/i)?.[0] || xml.match(/<feed[\s\S]*?(?=<entry[\s>])/i)?.[0] || '';
+  const channel =
+    xml.match(/<channel[\s>][\s\S]*?(?=<item[\s>]|<\/channel>)/i)?.[0] ||
+    xml.match(/<feed[\s\S]*?(?=<entry[\s>])/i)?.[0] ||
+    '';
   const source = cleanText(tag(channel, 'title')).replace(/\s*[-|｜].*$/, '').trim();
   const blocks = xml.match(/<(item|entry)[\s>][\s\S]*?<\/\1>/gi) || [];
   const items: NewsItem[] = [];
@@ -65,155 +103,363 @@ export function parseFeed(xml: string): { source: string; items: NewsItem[] } {
     const title = cleanText(tag(b, 'title'));
     let url = cleanText(tag(b, 'link'));
     if (!url) url = b.match(/<link[^>]*href="([^"]+)"/i)?.[1] || b.match(/rdf:about="([^"]+)"/i)?.[1] || '';
+    url = decodeEntities(url).replace(/[?&]utm_[^=]+=[^&]*/g, '');
     const summary = cleanText(tag(b, 'description') || tag(b, 'summary') || tag(b, 'content:encoded') || tag(b, 'content'))
       .replace(/[\s(（\[【]*(続きを読む|続きはこちら|全文を読む|もっと見る|Read more)[\s)）\]】»>…]*$/i, '')
       .trim();
     const published = cleanText(tag(b, 'pubDate') || tag(b, 'dc:date') || tag(b, 'updated') || tag(b, 'published'));
-    if (!title || !/^https?:\/\//.test(url)) continue;
-    // 概要がタイトルと同じ・極端に短いものは要約なし扱い
-    const usable = summary && summary.length >= 20 && summary !== title ? summary : undefined;
-    items.push({ title, url: decodeEntities(url), summary: usable, source: source || undefined, published: published || undefined });
+    if (!title || !/^https?:\/\/[^/]+\/.+/.test(url)) continue; // トップページだけのURLは除外
+    const usable = summary && summary.length >= 20 && summary !== title ? truncateSentences(summary) : undefined;
+    items.push({
+      title,
+      url,
+      summary: usable,
+      summaryKind: usable ? 'rss' : undefined,
+      source: source || undefined,
+      published: published || undefined
+    });
   }
   return { source, items };
 }
 
-// 文の区切りで maxLen 以内に収める
-export function truncateSentences(text: string, maxLen = SUMMARY_MAX): string {
-  if (text.length <= maxLen) return text;
-  const sentences = text.match(/[^。！？!?]+[。！？!?]?/g) || [text];
-  let out = '';
-  for (const s of sentences) {
-    if ((out + s).length > maxLen) break;
-    out += s;
-  }
-  if (!out) out = text.slice(0, maxLen - 1) + '…';
-  return out.trim();
-}
-
-async function fetchFeed(url: string): Promise<{ source: string; items: NewsItem[] }> {
+async function fetchFeed(url: string) {
   const res = await fetch(url, {
-    headers: { 'User-Agent': UA, Accept: 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8' },
-    cf: { cacheTtl: 600 }
-  } as RequestInit);
+    headers: { 'User-Agent': UA, Accept: 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8' }
+  });
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
   return parseFeed(await res.text());
 }
 
-async function polishSummary(env: any, title: string, text: string): Promise<string | null> {
+// ====================== robots.txt ======================
+export function robotsAllows(robotsTxt: string, path: string, agent = UA_TOKEN): boolean {
+  type Group = { agents: string[]; rules: { allow: boolean; pattern: string }[] };
+  const groups: Group[] = [];
+  let cur: Group | null = null;
+  let lastWasAgent = false;
+  for (const raw of robotsTxt.split(/\r?\n/)) {
+    const line = raw.replace(/#.*/, '').trim();
+    const m = line.match(/^([A-Za-z-]+)\s*:\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1].toLowerCase();
+    const val = m[2].trim();
+    if (key === 'user-agent') {
+      if (!cur || !lastWasAgent) { cur = { agents: [], rules: [] }; groups.push(cur); }
+      cur.agents.push(val.toLowerCase());
+      lastWasAgent = true;
+    } else {
+      lastWasAgent = false;
+      if (cur && (key === 'allow' || key === 'disallow') && val) cur.rules.push({ allow: key === 'allow', pattern: val });
+    }
+  }
+  const a = agent.toLowerCase();
+  const group = groups.find(g => g.agents.some(x => x !== '*' && a.includes(x))) || groups.find(g => g.agents.includes('*'));
+  if (!group) return true;
+  let best: { allow: boolean; len: number } | null = null;
+  for (const r of group.rules) {
+    const re = new RegExp('^' + r.pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\\\$$/, '$'));
+    if (re.test(path) && (!best || r.pattern.length > best.len || (r.pattern.length === best.len && r.allow))) {
+      best = { allow: r.allow, len: r.pattern.length };
+    }
+  }
+  return best ? best.allow : true;
+}
+
+async function isAllowedByRobots(env: any, url: string): Promise<boolean> {
+  const u = new URL(url);
+  const key = `robots:${u.host}`;
+  let txt: string | null = await env.NEWS_KV.get(key);
+  if (txt === null) {
+    try {
+      const res = await fetch(`${u.protocol}//${u.host}/robots.txt`, { headers: { 'User-Agent': UA } });
+      txt = res.ok ? await res.text() : res.status >= 500 ? 'User-agent: *\nDisallow: /' : '';
+    } catch {
+      txt = 'User-agent: *\nDisallow: /'; // 確認できないときは取得しない
+    }
+    await env.NEWS_KV.put(key, txt.slice(0, 50000), { expirationTtl: ROBOTS_TTL });
+  }
+  return robotsAllows(txt, u.pathname + u.search);
+}
+
+// ====================== 記事本文の抽出 ======================
+const BOILERPLATE = /(Copyright|©|All rights reserved|関連記事|関連リンク|ランキング|会員登録|ログイン|シェアする|ブックマーク|続きを読む|この記事を|PR：|PR:|お問い合わせ|利用規約|プライバシー)/i;
+const SKIP_TAGS = new Set(['aside', 'nav', 'footer', 'header', 'form', 'figure', 'figcaption', 'li', 'button', 'select', 'noscript', 'style', 'script', 'template', 'svg', 'iframe']);
+const SKIP_ATTR = /(related|ranking|share|sns|author|footer|breadcrumb|recommend|banner|comment|pickup|popular)/i;
+const BODY_ATTR = /(^|[\s_-])(cmsBody|article[_-]?body|articleBody|entry-content|post-content|cntimage|news_body|main-text)([\s_-]|$)/i;
+const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+
+export async function extractArticle(res: Response): Promise<{ title?: string; description?: string; body: string }> {
+  const parts: string[] = []; // 本文候補（文書順）
+  let ldBody = '';
+  let ldBuf: string | null = null;
+  let ogTitle = '';
+  let ogDesc = '';
+  let skipDepth = 0;
+  let bodyDepth = 0;
+  let pBuf: string | null = null; // <p> の中のテキスト
+  let blockBuf = ''; // <p> を使わず <br> 区切りで書かれた本文用
+
+  const flushBlock = () => {
+    const t = cleanText(blockBuf);
+    if (t) parts.push(t);
+    blockBuf = '';
+  };
+
+  // onEndTag は1要素に1つしか登録できないため、すべて '*' の1ハンドラで処理する
+  const rewriter = new HTMLRewriter().on('*', {
+    element(el) {
+      const tagName = el.tagName.toLowerCase();
+      if (VOID_TAGS.has(tagName)) {
+        if (tagName === 'meta') {
+          const p = (el.getAttribute('property') || el.getAttribute('name') || '').toLowerCase();
+          const c = el.getAttribute('content') || '';
+          if (p === 'og:title' && !ogTitle) ogTitle = c;
+          if ((p === 'og:description' || p === 'description') && !ogDesc) ogDesc = c;
+        } else if (tagName === 'br' && bodyDepth > 0 && pBuf === null) {
+          flushBlock();
+        }
+        return;
+      }
+      const attrs = `${el.getAttribute('class') || ''} ${el.getAttribute('id') || ''}`;
+      const isLd = tagName === 'script' && (el.getAttribute('type') || '').includes('ld+json');
+      const isSkip = !isLd && (SKIP_TAGS.has(tagName) || SKIP_ATTR.test(attrs));
+      const isBody = !isSkip && (el.getAttribute('itemprop') === 'articleBody' || BODY_ATTR.test(attrs) || tagName === 'article' || tagName === 'main');
+      const isP = tagName === 'p' && skipDepth === 0 && !isSkip;
+      const isBlockBoundary = tagName === 'div' || /^h[1-6]$/.test(tagName);
+
+      if (isLd) ldBuf = '';
+      if (isSkip) skipDepth++;
+      if (isBody) bodyDepth++;
+      if (isBlockBoundary && bodyDepth > 0 && pBuf === null) flushBlock();
+      if (isP) { if (bodyDepth > 0) flushBlock(); pBuf = ''; }
+
+      el.onEndTag(() => {
+        if (isLd && ldBuf !== null) {
+          try {
+            const data = JSON.parse(ldBuf);
+            const list = Array.isArray(data) ? data : data['@graph'] || [data];
+            for (const d of list) if (d?.articleBody && String(d.articleBody).length > ldBody.length) ldBody = String(d.articleBody);
+          } catch { /* ignore */ }
+          ldBuf = null;
+        }
+        if (isP && pBuf !== null) {
+          const t = cleanText(pBuf);
+          if (t) parts.push(t);
+          pBuf = null;
+        }
+        if (isBlockBoundary && bodyDepth > 0 && pBuf === null) flushBlock();
+        if (isBody) { flushBlock(); bodyDepth--; }
+        if (isSkip) skipDepth--;
+      });
+    },
+    text(t) {
+      if (ldBuf !== null) { ldBuf += t.text; return; }
+      if (skipDepth > 0) return;
+      if (pBuf !== null) pBuf += t.text;
+      else if (bodyDepth > 0) blockBuf += t.text;
+    }
+  });
+
+  await rewriter.transform(res).arrayBuffer();
+  flushBlock();
+
+  const good = (s: string) => s.length >= 25 && hasJapanese(s) && !BOILERPLATE.test(s.slice(0, 60));
+  const fromHtml = [...new Set(parts.filter(good))].join('\n');
+  const ld = cleanText(ldBody);
+  const body = ld.length > fromHtml.length ? ld : fromHtml;
+  return { title: cleanText(ogTitle) || undefined, description: cleanText(ogDesc) || undefined, body: body.slice(0, 6000) };
+}
+
+// ====================== AI 要約 ======================
+async function summarize(env: any, title: string, body: string): Promise<string | null> {
   if (!env.AI) return null;
   try {
-    const model = env.SUMMARY_MODEL || DEFAULT_MODEL;
-    const res: any = await env.AI.run(model, {
+    const res: any = await env.AI.run(env.SUMMARY_MODEL || DEFAULT_MODEL, {
       messages: [
         {
           role: 'system',
           content:
-            'あなたはニュースを読み上げるアナウンサーです。与えられた記事概要だけを根拠に、日本語の「です・ます」調で、' +
-            `${SUMMARY_MAX}字以内・2〜3文の読み上げ原稿にしてください。概要にない事実は絶対に足さないこと。` +
+            'あなたはニュースを読み上げるアナウンサーです。与えられた記事本文だけを根拠に、日本語の「です・ます」調で、' +
+            `${SUMMARY_MAX}字以内・3〜4文の読み上げ原稿を作ってください。` +
+            '「誰が・何を・なぜ・今後どうなるか」が伝わるようにし、本文にない事実や意見は絶対に足さないこと。' +
             'タイトルの繰り返し、前置き、箇条書き、記号、URLは書かず、原稿の本文だけを出力してください。'
         },
-        { role: 'user', content: `タイトル：${title}\n概要：${text.slice(0, 1500)}` }
+        { role: 'user', content: `タイトル：${title}\n本文：\n${body.slice(0, 3500)}` }
       ],
-      max_tokens: 400,
+      max_tokens: 600,
       temperature: 0.2
     });
     const out = String(res?.response ?? res?.choices?.[0]?.message?.content ?? '')
       .replace(/<think>[\s\S]*?<\/think>/g, '')
+      .replace(/^(原稿|読み上げ原稿)[:：]\s*/, '')
       .replace(/^[「『"]|[」』"]$/g, '')
+      .replace(/\s+/g, ' ')
       .trim();
-    // 日本語として妥当かを簡易チェック
-    if (out.length < 20 || out.length > SUMMARY_MAX * 1.5 || !/[ぁ-んァ-ヶ一-龠]/.test(out)) return null;
-    return out;
+    if (out.length < 40 || !hasJapanese(out)) return null;
+    return truncateSentences(out, Math.round(SUMMARY_MAX * 1.2));
   } catch (e) {
     console.error('AI summary failed', e);
     return null;
   }
 }
 
+async function sumKey(url: string) {
+  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(url));
+  return 'sum:' + [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 記事ページ → 本文抽出 → AI要約。結果はKVにキャッシュ
+async function getOrCreateSummary(env: any, item: NewsItem): Promise<SummaryRecord> {
+  const key = await sumKey(item.url);
+  const cached: SummaryRecord | null = await env.NEWS_KV.get(key, 'json');
+  if (cached) return cached;
+
+  let record: SummaryRecord = { failed: true, at: new Date().toISOString() };
+  try {
+    if (!(await isAllowedByRobots(env, item.url))) throw new Error('disallowed by robots.txt');
+    const res = await fetch(item.url, { headers: { 'User-Agent': UA, Accept: 'text/html' }, redirect: 'follow' });
+    if (!res.ok || !(res.headers.get('content-type') || '').includes('html')) throw new Error(`article ${res.status}`);
+    const article = await extractArticle(res);
+    const text = article.body.length >= 120 ? article.body : [item.summary, article.description, article.body].filter(Boolean).join('\n');
+    if (text.length < 60) throw new Error('body too short');
+    const summary = await summarize(env, item.title, text);
+    if (summary) record = { summary, at: new Date().toISOString() };
+  } catch (e) {
+    console.error('summary failed', item.url, String(e));
+  }
+  await env.NEWS_KV.put(key, JSON.stringify(record), { expirationTtl: record.failed ? FAIL_TTL : SUMMARY_TTL });
+  return record;
+}
+
+async function overlaySummaries(env: any, data: any) {
+  for (const cat of Object.keys(FEEDS)) {
+    const items: NewsItem[] = data[cat] || [];
+    await Promise.all(
+      items.map(async item => {
+        const rec: SummaryRecord | null = await env.NEWS_KV.get(await sumKey(item.url), 'json');
+        if (rec?.summary) { item.summary = rec.summary; item.summaryKind = 'ai'; }
+      })
+    );
+    // 中身（要約）がある記事だけを表示
+    data[cat] = items.filter(i => i.summary).slice(0, MAX_ITEMS);
+  }
+  return data;
+}
+
+// まだAI要約がない記事を少しずつ作る
+async function warmSummaries(env: any, data: any, limit: number) {
+  const queue: NewsItem[] = [];
+  // カテゴリを交互に並べ、上位の記事から優先
+  for (let i = 0; i < CANDIDATES; i++) {
+    for (const cat of Object.keys(FEEDS)) {
+      const it = (data[cat] || [])[i];
+      if (it) queue.push(it);
+    }
+  }
+  const todo: NewsItem[] = [];
+  for (const item of queue) {
+    if (todo.length >= limit) break;
+    if (!(await env.NEWS_KV.get(await sumKey(item.url)))) todo.push(item);
+  }
+  // 3件ずつ並列で作成
+  for (let i = 0; i < todo.length; i += 3) {
+    await Promise.all(todo.slice(i, i + 3).map(item => getOrCreateSummary(env, item)));
+  }
+}
+
+// ====================== ニュース一覧 ======================
 async function buildNews(env: any, previous: any) {
   const data: any = { version: DATA_VERSION };
-  let aiCalls = 0;
-
   for (const [category, urls] of Object.entries(FEEDS)) {
-    // 中身（要約）がある記事だけを集める。足りなければ次のフィードからも補充する
-    let items: NewsItem[] = [];
+    const items: NewsItem[] = [];
     for (const url of urls) {
-      if (items.length >= MAX_ITEMS) break;
+      if (items.length >= CANDIDATES) break;
       try {
         const feed = await fetchFeed(url);
         for (const i of feed.items) {
-          if (!i.summary || items.some(x => x.url === i.url)) continue;
+          if (items.some(x => x.url === i.url)) continue;
           items.push(i);
-          if (items.length >= MAX_ITEMS) break;
+          if (items.length >= CANDIDATES) break;
         }
       } catch (e) {
-        console.error('feed failed', category, url, e);
+        console.error('feed failed', category, url, String(e));
       }
     }
-
-    for (const item of items) {
-      if (item.summary && item.summary.length > SUMMARY_MAX) {
-        let polished: string | null = null;
-        if (aiCalls < MAX_AI_CALLS) {
-          aiCalls++;
-          polished = await polishSummary(env, item.title, item.summary);
-        }
-        item.summary = polished || truncateSentences(item.summary);
-      }
-    }
-
-    // 取得に失敗したカテゴリは前回のデータを使い続ける
-    if (!items.length && Array.isArray(previous?.[category])) items = previous[category];
-    data[category] = items;
+    data[category] = items.length ? items : previous?.[category] || [];
   }
-
   data.last_updated = new Date().toISOString();
   return data;
 }
 
-async function refreshNews(env: any) {
-  const prevString = await env.NEWS_KV.get('latest_news');
+async function refreshNews(env: any, warm: number) {
+  const prevString = await env.NEWS_KV.get('latest_raw');
   const previous = prevString ? JSON.parse(prevString) : null;
   const data = await buildNews(env, previous?.version === DATA_VERSION ? previous : null);
   const hasAny = Object.keys(FEEDS).some(k => data[k]?.length);
-  if (hasAny) await env.NEWS_KV.put('latest_news', JSON.stringify(data));
-  return hasAny ? data : previous;
+  if (!hasAny) return previous;
+  await env.NEWS_KV.put('latest_raw', JSON.stringify(data));
+  if (warm > 0) await warmSummaries(env, data, warm);
+  return data;
 }
 
+async function loadRaw(env: any, ctx: any) {
+  const s = await env.NEWS_KV.get('latest_raw');
+  const raw = s ? JSON.parse(s) : null;
+  if (!raw || raw.version !== DATA_VERSION) {
+    // 初回（またはデータ形式の更新直後）は一覧を作り直し、AI要約もまとめて作り始める
+    const fresh = await refreshNews(env, 0);
+    if (fresh) ctx?.waitUntil?.(warmSummaries(env, fresh, WARM_ON_CRON));
+    return fresh;
+  }
+  if (Date.now() - new Date(raw.last_updated).getTime() > 13 * 3600 * 1000) ctx?.waitUntil?.(refreshNews(env, 0));
+  return raw;
+}
+
+// ====================== HTTP ======================
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
   'Content-Type': 'application/json; charset=utf-8'
 };
-const json = (body: any, status = 200) => new Response(JSON.stringify(body), { status, headers: corsHeaders });
+const json = (body: any, status = 200, extra: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, ...extra } });
 
 export default {
-  // ① Cronで定期実行（JST 5:00, 17:00）
   async scheduled(_event: any, env: any, ctx: any) {
-    const p = refreshNews(env);
-    if (ctx?.waitUntil) ctx.waitUntil(p);
+    const p = refreshNews(env, WARM_ON_CRON);
+    ctx?.waitUntil?.(p);
     await p;
   },
 
-  // ② フロントエンドからのリクエスト
   async fetch(request: Request, env: any, ctx: any) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
     if (url.pathname === '/api/news') {
-      const cached = await env.NEWS_KV.get('latest_news');
-      const parsed = cached ? JSON.parse(cached) : null;
-      // KVが空、または旧形式（ダミーデータ）のときはその場で取得し直す
-      if (!parsed || parsed.version !== DATA_VERSION) {
-        const fresh = await refreshNews(env);
-        return json(fresh || { last_updated: null });
-      }
-      // 13時間以上更新されていなければ裏で更新（Cron失敗時の保険）
-      if (Date.now() - new Date(parsed.last_updated).getTime() > 13 * 3600 * 1000) {
-        ctx?.waitUntil?.(refreshNews(env));
-      }
-      return new Response(cached, { headers: corsHeaders });
+      const raw = await loadRaw(env, ctx);
+      if (!raw) return json({ last_updated: null });
+      const data = await overlaySummaries(env, JSON.parse(JSON.stringify(raw)));
+      ctx?.waitUntil?.(warmSummaries(env, raw, WARM_ON_REQUEST));
+      return json(data, 200, { 'Cache-Control': 'public, max-age=60' });
+    }
+
+    if (url.pathname === '/api/summary') {
+      const target = url.searchParams.get('url') || '';
+      const raw = await loadRaw(env, ctx);
+      // 一覧に載っている記事だけを対象にする（任意URLの取得には使わせない）
+      let item: NewsItem | undefined;
+      for (const cat of Object.keys(FEEDS)) item = item || (raw?.[cat] || []).find((i: NewsItem) => i.url === target);
+      if (!item) return json({ error: 'unknown article' }, 404);
+      const rec = await getOrCreateSummary(env, item);
+      if (rec.summary) return json({ url: item.url, summary: rec.summary, summaryKind: 'ai' });
+      if (item.summary) return json({ url: item.url, summary: item.summary, summaryKind: 'rss' });
+      return json({ url: item.url, summary: null }, 200);
+    }
+
+    // 手動で再取得（wrangler secret で REFRESH_TOKEN を設定した場合のみ有効）
+    if (url.pathname === '/api/refresh' && env.REFRESH_TOKEN && url.searchParams.get('token') === env.REFRESH_TOKEN) {
+      const data = await refreshNews(env, WARM_ON_CRON);
+      return json({ ok: true, last_updated: data?.last_updated });
     }
 
     return json({ error: 'Not Found' }, 404);
