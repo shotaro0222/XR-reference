@@ -16,6 +16,6 @@ bucket_name = "ar-assets-bucket"
 binding = "NEWS_KV"
 id = "ac465d82796a476ea2e299bcc6a0c278" # 後述のコマンドで取得したIDを入れる
 
-# 毎日朝6:00 (JST) / 21:00 (UTC) に自動取得を実行
+# JST 5:00 (UTC 20:00) と JST 17:00 (UTC 08:00) に自動実行するCron設定
 [triggers]
-crons = ["0 21 * * *"]
+crons = ["0 20 * * *", "0 8 * * *"]

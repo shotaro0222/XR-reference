@@ -1,4 +1,51 @@
 export default {
+  // ① Cronで定期実行される処理（JST 5:00, 17:00）
+  async scheduled(event: any, env: any, ctx: any) {
+    console.log("定期ニュース取得を実行します...");
+    
+    // ここで外部のRSSやAPIから最新ニュースを最大6件ずつ取得するロジックが走ります
+    // 今回はモックデータ生成をKVに保存する形をとりますが、必要に応じてfetch()で実際のXML等をパースできます
+    const updatedNewsData = {
+      it: [
+        { title: "高性能AI普及へ 年内に行動計画", url: "https://news.yahoo.co.jp/" },
+        { title: "セコマ個人情報漏えい 第三者閲覧", url: "https://news.yahoo.co.jp/" },
+        { title: "次世代スマホ、来月ついに発表か", url: "https://news.yahoo.co.jp/" },
+        { title: "量子コンピューター、実用化へ新技術", url: "https://news.yahoo.co.jp/" },
+        { title: "都内で自動運転タクシーの実験開始", url: "https://news.yahoo.co.jp/" },
+        { title: "AIによる業務効率化、8割の企業が検討", url: "https://news.yahoo.co.jp/" }
+      ],
+      business: [
+        { title: "佐川急便 宅配便平均13%値上げへ", url: "https://news.yahoo.co.jp/" },
+        { title: "東北3地銀 28年4月統合向け協議へ", url: "https://news.yahoo.co.jp/" },
+        { title: "日経平均反発、一時4万円台を回復", url: "https://news.yahoo.co.jp/" },
+        { title: "主要コンビニ3社、増益基調を維持", url: "https://news.yahoo.co.jp/" },
+        { title: "円安進行、輸出企業の業績を押し上げ", url: "https://news.yahoo.co.jp/" },
+        { title: "国内スタートアップ投資額が過去最高に", url: "https://news.yahoo.co.jp/" }
+      ],
+      entertainment: [
+        { title: "宮根誠司「ミヤネ屋」最終回で涙", url: "https://news.yahoo.co.jp/" },
+        { title: "綾瀬はるか 天然発言で会場沸かす", url: "https://news.yahoo.co.jp/" },
+        { title: "大ヒット映画の続編、来夏公開決定", url: "https://news.yahoo.co.jp/" },
+        { title: "人気アイドルグループ、電撃解散を発表", url: "https://news.yahoo.co.jp/" },
+        { title: "著名俳優が語る、舞台裏のマル秘エピソード", url: "https://news.yahoo.co.jp/" },
+        { title: "新作アニメ、初回放送で世界トレンド1位", url: "https://news.yahoo.co.jp/" }
+      ],
+      funny: [
+        { title: "流行語ドパガキどう広がった 分析", url: "https://news.yahoo.co.jp/" },
+        { title: "犬が猫に説教？ネットで話題の動画", url: "https://news.yahoo.co.jp/" },
+        { title: "小学生のテスト珍回答にSNS爆笑", url: "https://news.yahoo.co.jp/" },
+        { title: "UFO目撃情報？実はただの街灯だった", url: "https://news.yahoo.co.jp/" },
+        { title: "店長手作りの「変な看板」が大人気", url: "https://news.yahoo.co.jp/" },
+        { title: "街で見かけた不思議なファッション", url: "https://news.yahoo.co.jp/" }
+      ],
+      last_updated: new Date().toISOString()
+    };
+
+    // 取得したデータをKVデータベースに保存
+    await env.NEWS_KV.put("latest_news", JSON.stringify(updatedNewsData));
+  },
+
+  // ② フロントエンドからリクエストが来た時の処理
   async fetch(request: Request, env: any) {
     const url = new URL(request.url);
     const corsHeaders = {
@@ -10,46 +57,20 @@ export default {
 
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-    // --- 1. ニュース配信API（オモシロ復活＆件数増加） ---
+    // --- ニュース配信API（KVから取得） ---
     if (url.pathname === "/api/news") {
-      const newsData = {
-        it: [
-          { title: "高性能AI普及へ 年内に行動計画", url: "https://news.yahoo.co.jp/" },
-          { title: "セコマ個人情報漏えい 第三者閲覧", url: "https://news.yahoo.co.jp/" },
-          { title: "次世代スマホ、来月ついに発表か", url: "https://news.yahoo.co.jp/" },
-          { title: "量子コンピューター、実用化へ新技術", url: "https://news.yahoo.co.jp/" },
-          { title: "都内で自動運転タクシーの実験開始", url: "https://news.yahoo.co.jp/" },
-          { title: "AIによる業務効率化、8割の企業が検討", url: "https://news.yahoo.co.jp/" }
-        ],
-        business: [
-          { title: "佐川急便 宅配便平均13%値上げへ", url: "https://news.yahoo.co.jp/" },
-          { title: "東北3地銀 28年4月統合向け協議へ", url: "https://news.yahoo.co.jp/" },
-          { title: "日経平均反発、一時4万円台を回復", url: "https://news.yahoo.co.jp/" },
-          { title: "主要コンビニ3社、増益基調を維持", url: "https://news.yahoo.co.jp/" },
-          { title: "円安進行、輸出企業の業績を押し上げ", url: "https://news.yahoo.co.jp/" },
-          { title: "国内スタートアップ投資額が過去最高に", url: "https://news.yahoo.co.jp/" }
-        ],
-        entertainment: [
-          { title: "宮根誠司「ミヤネ屋」最終回で涙", url: "https://news.yahoo.co.jp/" },
-          { title: "綾瀬はるか 天然発言で会場沸かす", url: "https://news.yahoo.co.jp/" },
-          { title: "大ヒット映画の続編、来夏公開決定", url: "https://news.yahoo.co.jp/" },
-          { title: "人気アイドルグループ、電撃解散を発表", url: "https://news.yahoo.co.jp/" },
-          { title: "著名俳優が語る、舞台裏のマル秘エピソード", url: "https://news.yahoo.co.jp/" },
-          { title: "新作アニメ、初回放送で世界トレンド1位", url: "https://news.yahoo.co.jp/" }
-        ],
-        funny: [
-          { title: "流行語ドパガキどう広がった 分析", url: "https://news.yahoo.co.jp/" },
-          { title: "犬が猫に説教？ネットで話題の動画", url: "https://news.yahoo.co.jp/" },
-          { title: "小学生のテスト珍回答にSNS爆笑", url: "https://news.yahoo.co.jp/" },
-          { title: "UFO目撃情報？実はただの街灯だった", url: "https://news.yahoo.co.jp/" },
-          { title: "店長手作りの「変な看板」が大人気", url: "https://news.yahoo.co.jp/" },
-          { title: "街で見かけた不思議なファッション", url: "https://news.yahoo.co.jp/" }
-        ]
-      };
-      return new Response(JSON.stringify(newsData), { headers: corsHeaders });
+      let newsDataString = await env.NEWS_KV.get("latest_news");
+      
+      // まだCronが走っていなくてKVが空の場合の安全策
+      if (!newsDataString) {
+        // 手動でCron処理を1回呼び出してデータを作る
+        await this.scheduled(null, env, null);
+        newsDataString = await env.NEWS_KV.get("latest_news");
+      }
+      return new Response(newsDataString, { headers: corsHeaders });
     }
 
-    // --- 2. 生成API (完全無料版) ---
+    // --- 生成系APIは前回と同じ ---
     if (url.pathname === "/api/generate" && request.method === "POST") {
       const body: any = await request.json();
       const keyword = body.keyword || "cyberpunk";
@@ -60,14 +81,12 @@ export default {
         const imageUrl = `https://image.pollinations.ai/prompt/${prompt}`;
         return new Response(JSON.stringify({ url: imageUrl }), { headers: corsHeaders });
       } 
-      
       if (mode === "3d") {
         const modelIndex = Math.floor(Math.random() * 3);
         return new Response(JSON.stringify({ taskId: `free-${modelIndex}` }), { headers: corsHeaders });
       }
     }
 
-    // --- 3. 3D進捗確認API (完全無料版) ---
     if (url.pathname === "/api/status" && request.method === "GET") {
       const taskId = url.searchParams.get("taskId") || "";
       const sampleModels = [
