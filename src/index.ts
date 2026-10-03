@@ -135,16 +135,16 @@ async function buildNews(env: any, previous: any) {
   let aiCalls = 0;
 
   for (const [category, urls] of Object.entries(FEEDS)) {
+    // 中身（要約）がある記事だけを集める。足りなければ次のフィードからも補充する
     let items: NewsItem[] = [];
     for (const url of urls) {
+      if (items.length >= MAX_ITEMS) break;
       try {
         const feed = await fetchFeed(url);
-        // 要約付きの記事を優先
-        const withSummary = feed.items.filter(i => i.summary);
-        const picked = (withSummary.length >= 3 ? withSummary : feed.items).slice(0, MAX_ITEMS);
-        if (picked.length) {
-          items = picked;
-          break;
+        for (const i of feed.items) {
+          if (!i.summary || items.some(x => x.url === i.url)) continue;
+          items.push(i);
+          if (items.length >= MAX_ITEMS) break;
         }
       } catch (e) {
         console.error('feed failed', category, url, e);
