@@ -512,12 +512,13 @@ async function extractTerms(env: any, item: NewsItem): Promise<string[]> {
             '次のニュースの中から、一般の人や中学生にはわかりにくいと思われる専門用語・固有名詞・略語を最大5つ選び、' +
             '本文に書かれている表記のまま JSON の文字列配列だけで出力してください。例：["量子コンピューター","DX"]'
         },
-        { role: 'user', content: context }
+        { role: 'user', content: context.replace(/\n出典：.*$/, '') }
       ],
       max_tokens: 200,
       temperature: 0
     });
-    return parseTerms(aiText(res), context);
+    // 出典のメディア名は候補から外す
+    return parseTerms(aiText(res), context.replace(/\n出典：.*$/, '')).filter(t => !item.source || !item.source.includes(t));
   } catch (e) {
     console.error('AI terms failed', e);
     return [];
