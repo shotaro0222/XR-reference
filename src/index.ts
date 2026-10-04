@@ -414,10 +414,120 @@ async function loadRaw(env: any, ctx: any) {
   return raw;
 }
 
+// ====================== 質問への回答・難しい単語 ======================
+const ASK_MAX_QUESTION = 200;
+const ASK_MAX_HISTORY = 6;
+const ASK_RATE_PER_HOUR = 40; // 1つのIPから1時間に受け付ける質問数
+const ASK_CACHE_TTL = 60 * 60 * 24 * 3;
+
+type ChatTurn = { role: 'user' | 'assistant'; content: string };
+
+function findItem(raw: any, url: string): NewsItem | undefined {
+  if (!raw || !url) return undefined;
+  for (const cat of Object.keys(FEEDS)) {
+    const hit = (raw[cat] || []).find((i: NewsItem) => i.url === url);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+async function articleContext(env: any, item?: NewsItem): Promise<string> {
+  if (!item) return '';
+  const rec: SummaryRecord | null = await env.NEWS_KV.get(await sumKey(item.url), 'json');
+  const summary = rec?.summary || item.summary || '';
+  return `ニュースのタイトル：${item.title}\nニュースの内容：${summary}${item.source ? `\n出典：${item.source}` : ''}`;
+}
+
+function aiText(res: any): string {
+  return String(res?.response ?? res?.choices?.[0]?.message?.content ?? '')
+    .replace(/<think>[\s\S]*?<\/think>/g, '')
+    .trim();
+}
+
+async function hashKey(prefix: string, text: string) {
+  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(text));
+  return prefix + [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function rateLimited(env: any, request: Request): Promise<boolean> {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const key = `rl:${ip}:${Math.floor(Date.now() / 3600000)}`;
+  const n = parseInt((await env.NEWS_KV.get(key)) || '0', 10);
+  if (n >= ASK_RATE_PER_HOUR) return true;
+  await env.NEWS_KV.put(key, String(n + 1), { expirationTtl: 3700 });
+  return false;
+}
+
+async function answerQuestion(env: any, question: string, item: NewsItem | undefined, history: ChatTurn[]): Promise<string | null> {
+  if (!env.AI) return null;
+  const context = await articleContext(env, item);
+  const messages: { role: string; content: string }[] = [
+    {
+      role: 'system',
+      content:
+        'あなたはニュースを読み上げるロボット「ニュースサモナー」です。ユーザーはニュースを聞いていて、' +
+        'わからない言葉や内容について質問します。中学生にもわかる言葉で、「です・ます」調で、2〜3文・150字以内で答えてください。' +
+        'ニュースの中身についてはニュースの内容に書かれていることだけを根拠にし、言葉の意味や背景は一般的な知識で説明してかまいません。' +
+        '確かでないことは「はっきりとはわかりません」と正直に言い、作り話や推測を事実のように言わないこと。' +
+        '箇条書き、記号、URL、前置きは使わず、答えの本文だけを出力してください。' +
+        (context ? `\n\n【いま話題にしているニュース】\n${context}` : '')
+    },
+    ...history.slice(-ASK_MAX_HISTORY).map(t => ({ role: t.role, content: t.content.slice(0, 400) })),
+    { role: 'user', content: question }
+  ];
+  try {
+    const res = await env.AI.run(env.SUMMARY_MODEL || DEFAULT_MODEL, { messages, max_tokens: 400, temperature: 0.3 });
+    const out = aiText(res).replace(/^(答え|回答)[:：]\s*/, '').replace(/\s+/g, ' ');
+    if (out.length < 5 || !hasJapanese(out)) return null;
+    return truncateSentences(out, 220);
+  } catch (e) {
+    console.error('AI answer failed', e);
+    return null;
+  }
+}
+
+export function parseTerms(text: string, source: string): string[] {
+  let list: string[] = [];
+  const arr = text.match(/\[[\s\S]*\]/);
+  if (arr) {
+    try { list = JSON.parse(arr[0]); } catch { /* fallthrough */ }
+  }
+  if (!list.length) list = text.split(/[\n、,]/);
+  return [...new Set(
+    list
+      .map(t => String(t).replace(/^[\s\-・*\d.）)「『"]+|[\s」』"]+$/g, '').trim())
+      .filter(t => t.length >= 2 && t.length <= 20 && source.includes(t))
+  )].slice(0, 5);
+}
+
+async function extractTerms(env: any, item: NewsItem): Promise<string[]> {
+  if (!env.AI) return [];
+  const context = await articleContext(env, item);
+  try {
+    const res = await env.AI.run(env.SUMMARY_MODEL || DEFAULT_MODEL, {
+      messages: [
+        {
+          role: 'system',
+          content:
+            '次のニュースの中から、一般の人や中学生にはわかりにくいと思われる専門用語・固有名詞・略語を最大5つ選び、' +
+            '本文に書かれている表記のまま JSON の文字列配列だけで出力してください。例：["量子コンピューター","DX"]'
+        },
+        { role: 'user', content: context }
+      ],
+      max_tokens: 200,
+      temperature: 0
+    });
+    return parseTerms(aiText(res), context);
+  } catch (e) {
+    console.error('AI terms failed', e);
+    return [];
+  }
+}
+
 // ====================== HTTP ======================
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
   'Content-Type': 'application/json; charset=utf-8'
 };
@@ -454,6 +564,51 @@ export default {
       if (rec.summary) return json({ url: item.url, summary: rec.summary, summaryKind: 'ai' });
       if (item.summary) return json({ url: item.url, summary: item.summary, summaryKind: 'rss' });
       return json({ url: item.url, summary: null }, 200);
+    }
+
+    // ニュースについての質問に答える
+    if (url.pathname === '/api/ask' && request.method === 'POST') {
+      let body: any;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const question = String(body?.question || '').replace(/\s+/g, ' ').trim();
+      if (!question) return json({ error: 'empty question' }, 400);
+      if (question.length > ASK_MAX_QUESTION) return json({ error: 'question too long' }, 400);
+      const history: ChatTurn[] = Array.isArray(body?.history)
+        ? body.history
+            .filter((t: any) => (t?.role === 'user' || t?.role === 'assistant') && typeof t?.content === 'string')
+            .slice(-ASK_MAX_HISTORY)
+        : [];
+      const raw = await loadRaw(env, ctx);
+      const item = findItem(raw, String(body?.url || ''));
+
+      // 会話履歴のない同じ質問はキャッシュを返す（AIの利用量を抑える）
+      const cacheKey = history.length ? null : await hashKey('ask:', `${item?.url || ''}\n${question}`);
+      if (cacheKey) {
+        const hit = await env.NEWS_KV.get(cacheKey);
+        if (hit) return json({ answer: hit, cached: true });
+      }
+      if (await rateLimited(env, request)) {
+        return json({ error: 'rate limited', answer: 'たくさん質問してくれてありがとう！少し時間をおいてから、また聞いてください。' }, 429);
+      }
+      const answer = await answerQuestion(env, question, item, history);
+      if (!answer) return json({ error: 'ai failed', answer: 'ごめんなさい、うまく答えを作れませんでした。もう一度聞いてみてください。' }, 502);
+      if (cacheKey) await env.NEWS_KV.put(cacheKey, answer, { expirationTtl: ASK_CACHE_TTL });
+      return json({ answer });
+    }
+
+    // ニュースの中のわかりにくい単語（質問の候補）
+    if (url.pathname === '/api/terms') {
+      const raw = await loadRaw(env, ctx);
+      const item = findItem(raw, url.searchParams.get('url') || '');
+      if (!item) return json({ terms: [] }, 404);
+      const key = await hashKey('terms:', item.url);
+      const cached = await env.NEWS_KV.get(key, 'json');
+      if (cached) return json({ terms: cached });
+      const terms = await extractTerms(env, item);
+      // 要約がAI製になっていない段階の結果は短めにキャッシュ
+      const rec: SummaryRecord | null = await env.NEWS_KV.get(await sumKey(item.url), 'json');
+      await env.NEWS_KV.put(key, JSON.stringify(terms), { expirationTtl: rec?.summary ? SUMMARY_TTL : 3600 });
+      return json({ terms });
     }
 
     // 手動で再取得（wrangler secret で REFRESH_TOKEN を設定した場合のみ有効）
