@@ -1,5 +1,5 @@
 // (前半のimport、定数、パース関数、AI要約関数はいただいたコードと同じため省略せずそのまま記述します)
-const DATA_VERSION = 3;
+const DATA_VERSION = 4;
 const MAX_ITEMS = 6;
 const CANDIDATES = 10;
 const SUMMARY_MAX = 320;
@@ -21,7 +21,13 @@ const FEEDS: Record<string, string[]> = {
     'https://eiga.com/rss/news/',
     'https://www.cinemacafe.net/rss/index.rdf'
   ],
-  funny: ['https://gigazine.net/news/rss_2.0/', 'https://rss.itmedia.co.jp/rss/2.0/netlab.xml']
+  funny: ['https://gigazine.net/news/rss_2.0/', 'https://rss.itmedia.co.jp/rss/2.0/netlab.xml'],
+  politics: ['https://www3.nhk.or.jp/rss/news/cat4.xml'],
+  society: ['https://www3.nhk.or.jp/rss/news/cat1.xml'],
+  world: ['https://news.yahoo.co.jp/rss/topics/world.xml'],
+  sports: ['https://news.yahoo.co.jp/rss/topics/sports.xml'],
+  science: ['https://news.yahoo.co.jp/rss/topics/science.xml'],
+  lifestyle: ['https://rss.itmedia.co.jp/rss/2.0/lifestyle.xml']
 };
 
 export type NewsItem = {

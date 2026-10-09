@@ -2,6 +2,19 @@
 
 import { useState, useEffect } from 'react';
 
+const categoryMeta: Record<string, { label: string; icon: string; meaning: string }> = {
+  it: { label: 'IT', icon: '⚡', meaning: 'コンピューターやインターネット、アプリなどの情報技術に関するニュースです。' },
+  business: { label: 'ビジネス', icon: '📈', meaning: '会社の活動や新しい商品、働き方など、仕事や企業に関するニュースです。' },
+  entertainment: { label: 'エンタメ', icon: '🎬', meaning: '映画や音楽、テレビ、芸能など、楽しみや文化に関するニュースです。' },
+  funny: { label: 'オモシロ', icon: '🎭', meaning: '思わず笑ったり驚いたりする、ユニークで楽しい話題のニュースです。' },
+  politics: { label: '政治', icon: '🏛️', meaning: '国や地域のルール、政策、選挙など、政治の動きに関するニュースです。' },
+  society: { label: '社会', icon: '🏙️', meaning: '事件や事故、地域の出来事、社会が抱える課題などに関するニュースです。' },
+  world: { label: '国際', icon: '🌏', meaning: '日本以外の国や地域で起きた出来事、国どうしの関係に関するニュースです。' },
+  sports: { label: 'スポーツ', icon: '⚽', meaning: '試合の結果や選手の活躍、大会など、スポーツに関するニュースです。' },
+  science: { label: '科学', icon: '🔬', meaning: '自然のしくみを調べる研究や、新しい発見・技術に関するニュースです。' },
+  lifestyle: { label: '暮らし', icon: '🏠', meaning: '健康や食事、住まいなど、毎日の生活に役立つ話題のニュースです。' }
+};
+
 export default function ARMediaMVP() {
   const [keyword, setKeyword] = useState('');
   const [mode, setMode] = useState<'2.5d' | '3d'>('2.5d');
@@ -58,9 +71,11 @@ export default function ARMediaMVP() {
           {/* ニュース表示エリア */}
           {news ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {['it', 'business', 'entertainment'].map((category) => (
+              {Object.entries(categoryMeta).map(([category, meta]) => (
                 <div key={category} className="border rounded-lg p-4">
-                  <h3 className="font-bold text-gray-700 uppercase mb-2 border-b pb-1">{category}</h3>
+                  <h3 className="font-bold text-gray-700 mb-2 border-b pb-1" title={meta.meaning}>
+                    <span aria-hidden="true" className="mr-2">{meta.icon}</span>{meta.label}
+                  </h3>
                   <ul className="space-y-2 text-sm">
                     {news[category]?.map((article: any, i: number) => (
                       <li key={i}>
