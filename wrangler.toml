@@ -19,3 +19,17 @@ id = "ac465d82796a476ea2e299bcc6a0c278" # 後述のコマンドで取得したID
 # JST 5:00 (UTC 20:00) と JST 17:00 (UTC 08:00) に自動実行するCron設定
 [triggers]
 crons = ["0 20 * * *", "0 8 * * *"]
+
+# --- マネタイズ機能用（任意） ---
+# スポンサー／自治体向けの表示・タップ数の集計に使う D1。使う場合だけ下記を実行して有効化する
+#   npx wrangler d1 create news-summoner-stats
+# 表示された database_id を下に貼り、先頭の # を外す
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "news-summoner-stats"
+# database_id = "ここに貼る"
+#
+# 秘密情報（git に入れない）
+#   npx wrangler secret put ADMIN_TOKEN        … /admin のログイン用（必須）
+#   npx wrangler secret put PREMIUM_SECRET     … プレミアム証明の署名用（推奨。未設定時は ADMIN_TOKEN を使用）
+#   npx wrangler secret put STRIPE_SECRET_KEY  … Stripe で販売する場合のみ

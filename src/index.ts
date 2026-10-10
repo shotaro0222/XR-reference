@@ -1,3 +1,5 @@
+import { handleBiz, findDevice, localContext, loadConfig, livePlacements, track } from './biz';
+
 // (前半のimport、定数、パース関数、AI要約関数はいただいたコードと同じため省略せずそのまま記述します)
 const DATA_VERSION = 4;
 const MAX_ITEMS = 6;
@@ -439,18 +441,23 @@ async function hashKey(prefix: string, text: string) {
   return prefix + [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function rateLimited(env: any, request: Request): Promise<boolean> {
-  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+async function rateLimited(env: any, request: Request, limit = ASK_RATE_PER_HOUR, bucket?: string): Promise<boolean> {
+  const ip = bucket || request.headers.get('CF-Connecting-IP') || 'unknown';
   const key = `rl:${ip}:${Math.floor(Date.now() / 3600000)}`;
   const n = parseInt((await env.NEWS_KV.get(key)) || '0', 10);
-  if (n >= ASK_RATE_PER_HOUR) return true;
+  if (n >= limit) return true;
   await env.NEWS_KV.put(key, String(n + 1), { expirationTtl: 3700 });
   return false;
 }
 
-async function answerQuestion(env: any, question: string, item: NewsItem | undefined, history: ChatTurn[]): Promise<string | null> {
+type AskExtra = { embed?: { title?: string; summary?: string; source?: string } | null; local?: string; placement?: string };
+
+async function answerQuestion(env: any, question: string, item: NewsItem | undefined, history: ChatTurn[], extra: AskExtra = {}): Promise<string | null> {
   if (!env.AI) return null;
-  const context = await articleContext(env, item);
+  let context = await articleContext(env, item);
+  if (!context && extra.embed?.summary) {
+    context = `ニュースのタイトル：${extra.embed.title || ''}\nニュースの内容：${extra.embed.summary}${extra.embed.source ? `\n出典：${extra.embed.source}` : ''}`;
+  }
   const messages: { role: string; content: string }[] = [
     {
       role: 'system',
@@ -459,8 +466,11 @@ async function answerQuestion(env: any, question: string, item: NewsItem | undef
         'わからない言葉や内容について質問します。中学生にもわかる言葉で、「です・ます」調で、2〜3文・150字以内で答えてください。' +
         'ニュースの中身についてはニュースの内容に書かれていることだけを根拠にし、言葉の意味や背景は一般的な知識で説明してかまいません。' +
         '確かでないことは「はっきりとはわかりません」と正直に言い、作り話や推測を事実のように言わないこと。' +
+        'ニュース以外の雑談やあいさつにも、明るく親しみやすく短く答えてかまいません。' +
         '箇条書き、記号、URL、前置きは使わず、答えの本文だけを出力してください。' +
-        (context ? `\n\n【いま話題にしているニュース】\n${context}` : '')
+        (context ? `\n\n【いま話題にしているニュース】\n${context}` : '') +
+        (extra.placement ? `\n\n【いま表示している3D（提供企業・団体の紹介。広告であることを隠さないこと）】\n${extra.placement}` : '') +
+        (extra.local ? `\n\n【この場所で紹介している地域・観光情報（聞かれたら案内してよい）】\n${extra.local}` : '')
     },
     ...history.slice(-ASK_MAX_HISTORY).map(t => ({ role: t.role, content: t.content.slice(0, 400) })),
     { role: 'user', content: question }
@@ -517,8 +527,8 @@ async function extractTerms(env: any, item: NewsItem): Promise<string[]> {
 // ====================== HTTP ======================
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Content-Type': 'application/json; charset=utf-8'
 };
 const json = (body: any, status = 200, extra: Record<string, string> = {}) =>
@@ -534,6 +544,10 @@ export default {
   async fetch(request: Request, env: any, ctx: any) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
+
+    // 掲載枠・提携メディア・プレミアム・集計・管理API（src/biz.ts）
+    const biz = await handleBiz(request, env, ctx, url, { json, corsHeaders, extractArticle, summarize, hashKey, UA });
+    if (biz) return biz;
 
     if (url.pathname === '/api/news') {
       const raw = await loadRaw(env, ctx);
@@ -611,17 +625,30 @@ export default {
             .slice(-ASK_MAX_HISTORY)
         : [];
       const raw = await loadRaw(env, ctx);
-      const item = findItem(raw, String(body?.url || ''));
+      const askUrl = String(body?.url || '');
+      const item = findItem(raw, askUrl);
+      // 提携メディアの記事（埋め込みウィジェット）なら、その要約を文脈に使う
+      const embed = !item && /^https:\/\//.test(askUrl) ? await env.NEWS_KV.get(await hashKey('embed:', askUrl), 'json') : null;
+      // サイネージ端末：回数制限をゆるめ、地域情報を会話に使う
+      const device = await findDevice(env, String(body?.device || ''));
+      const local = device ? await localContext(env, device.region) : '';
+      // 表示中のスポンサー／ローカル3Dについての質問
+      const placementId = String(body?.placement || '');
+      const placement = placementId ? livePlacements(await loadConfig(env)).find(p => p.id === placementId) : undefined;
+      const placementText = placement ? `${placement.title}（提供：${placement.sponsor}）：${placement.description}` : '';
+      if (device) ctx?.waitUntil?.(track(env, 'signage_talk', device.id));
 
-      const cacheKey = history.length ? null : await hashKey('ask:', `${item?.url || ''}\n${question}`);
+      const cacheKey = history.length
+        ? null
+        : await hashKey('ask:', `${item?.url || (embed ? askUrl : '')}\n${device?.region || ''}\n${placement?.id || ''}\n${question}`);
       if (cacheKey) {
         const hit = await env.NEWS_KV.get(cacheKey);
         if (hit) return json({ answer: hit, cached: true });
       }
-      if (await rateLimited(env, request)) {
+      if (await rateLimited(env, request, device ? 600 : ASK_RATE_PER_HOUR, device ? `dev-${device.id}` : undefined)) {
         return json({ error: 'rate limited', answer: 'たくさん質問してくれてありがとう！少し時間をおいてから、また聞いてください。' }, 429);
       }
-      const answer = await answerQuestion(env, question, item, history);
+      const answer = await answerQuestion(env, question, item, history, { embed, local, placement: placementText });
       if (!answer) return json({ error: 'ai failed', answer: 'ごめんなさい、うまく答えを作れませんでした。もう一度聞いてみてください。' }, 502);
       if (cacheKey) await env.NEWS_KV.put(cacheKey, answer, { expirationTtl: ASK_CACHE_TTL });
       return json({ answer });
