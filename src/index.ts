@@ -1,7 +1,7 @@
 import { handleBiz, findDevice, localContext, loadConfig, livePlacements, track } from './biz';
 
 // (前半のimport、定数、パース関数、AI要約関数はいただいたコードと同じため省略せずそのまま記述します)
-const DATA_VERSION = 4;
+const DATA_VERSION = 5;
 const MAX_ITEMS = 6;
 const CANDIDATES = 10;
 const SUMMARY_MAX = 320;
@@ -24,13 +24,18 @@ const FEEDS: Record<string, string[]> = {
     'https://www.cinemacafe.net/rss/index.rdf'
   ],
   funny: ['https://gigazine.net/news/rss_2.0/', 'https://rss.itmedia.co.jp/rss/2.0/netlab.xml'],
-  politics: ['https://www3.nhk.or.jp/rss/news/cat4.xml'],
-  society: ['https://www3.nhk.or.jp/rss/news/cat1.xml'],
-  world: ['https://news.yahoo.co.jp/rss/topics/world.xml'],
-  sports: ['https://news.yahoo.co.jp/rss/topics/sports.xml'],
-  science: ['https://news.yahoo.co.jp/rss/topics/science.xml'],
-  lifestyle: ['https://rss.itmedia.co.jp/rss/2.0/lifestyle.xml']
+  // NHK は 2025年に配信元を news.web.nhk へ移転（旧 www3.nhk.or.jp の RSS は更新停止）。
+  // NHK の robots.txt は AI クローラーを拒否しているため、記事本文は取得せず RSS の概要だけを読み上げる（下の aiOptOut 参照）
+  politics: ['https://news.web.nhk/n-data/conf/na/rss/cat4.xml'],
+  society: ['https://news.web.nhk/n-data/conf/na/rss/cat1.xml'],
+  world: ['https://news.web.nhk/n-data/conf/na/rss/cat6.xml'],
+  sports: ['https://the-ans.jp/feed/', 'https://news.web.nhk/n-data/conf/na/rss/cat7.xml'],
+  science: ['http://scienceportal.jst.go.jp/feed/rss.xml', 'https://sorae.info/feed'],
+  lifestyle: ['https://www.lifehacker.jp/feed/index.xml']
 };
+
+// これより古い記事は表示しない（配信が止まったフィードの古いニュースが残らないように）
+const MAX_AGE_DAYS = 7;
 
 export type NewsItem = {
   title: string;
@@ -163,7 +168,17 @@ export function robotsAllows(robotsTxt: string, path: string, agent = UA_TOKEN):
   return best ? best.allow : true;
 }
 
+// 主要な AI クローラーをサイト全体で拒否しているか（＝AIでの利用を望んでいない媒体）
+const AI_AGENTS = ['GPTBot', 'ClaudeBot', 'Google-Extended', 'CCBot', 'anthropic-ai'];
+export function aiOptOut(robotsTxt: string): boolean {
+  return AI_AGENTS.some(a => !robotsAllows(robotsTxt, '/', a) && /user-agent/i.test(robotsTxt) && new RegExp(`user-agent\\s*:\\s*${a}`, 'i').test(robotsTxt));
+}
+
 async function isAllowedByRobots(env: any, url: string): Promise<boolean> {
+  return (await robotsInfo(env, url)).allowed;
+}
+
+async function robotsInfo(env: any, url: string): Promise<{ allowed: boolean; aiOptOut: boolean }> {
   const u = new URL(url);
   const key = `robots:${u.host}`;
   let txt: string | null = await env.NEWS_KV.get(key);
@@ -176,7 +191,7 @@ async function isAllowedByRobots(env: any, url: string): Promise<boolean> {
     }
     await env.NEWS_KV.put(key, txt.slice(0, 50000), { expirationTtl: ROBOTS_TTL });
   }
-  return robotsAllows(txt, u.pathname + u.search);
+  return { allowed: robotsAllows(txt, u.pathname + u.search), aiOptOut: aiOptOut(txt) };
 }
 
 // ====================== 記事本文の抽出 ======================
@@ -311,8 +326,12 @@ async function getOrCreateSummary(env: any, item: NewsItem): Promise<SummaryReco
   if (cached) return cached;
 
   let record: SummaryRecord = { failed: true, at: new Date().toISOString() };
+  let ttl = FAIL_TTL;
   try {
-    if (!(await isAllowedByRobots(env, item.url))) throw new Error('disallowed by robots.txt');
+    const robots = await robotsInfo(env, item.url);
+    if (!robots.allowed) throw new Error('disallowed by robots.txt');
+    // AI クローラーを拒否している媒体は、本文を取得せず RSS の概要だけを使う
+    if (robots.aiOptOut) { ttl = SUMMARY_TTL; throw new Error('publisher opts out of AI'); }
     const res = await fetch(item.url, { headers: { 'User-Agent': UA, Accept: 'text/html' }, redirect: 'follow' });
     if (!res.ok || !(res.headers.get('content-type') || '').includes('html')) throw new Error(`article ${res.status}`);
     const article = await extractArticle(res);
@@ -323,7 +342,7 @@ async function getOrCreateSummary(env: any, item: NewsItem): Promise<SummaryReco
   } catch (e) {
     console.error('summary failed', item.url, String(e));
   }
-  await env.NEWS_KV.put(key, JSON.stringify(record), { expirationTtl: record.failed ? FAIL_TTL : SUMMARY_TTL });
+  await env.NEWS_KV.put(key, JSON.stringify(record), { expirationTtl: record.failed ? ttl : SUMMARY_TTL });
   return record;
 }
 
@@ -370,6 +389,8 @@ async function buildNews(env: any, previous: any) {
         const feed = await fetchFeed(url);
         for (const i of feed.items) {
           if (items.some(x => x.url === i.url)) continue;
+          const t = i.published ? Date.parse(i.published) : NaN;
+          if (!isNaN(t) && Date.now() - t > MAX_AGE_DAYS * 86400_000) continue; // 古すぎる記事は除外
           items.push(i);
           if (items.length >= CANDIDATES) break;
         }
