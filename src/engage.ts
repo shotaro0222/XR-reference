@@ -473,6 +473,70 @@ async function leaderboard(env: any, scope: string) {
   return ((await env.NEWS_KV.get(`lb:${scope}:${todayJst()}`, 'json')) || []) as { name: string; score: number; at: string }[];
 }
 
+// ====================== 申し込み（振込・手動で有効化） ======================
+export type Application = {
+  id: string;
+  createdAt: string;
+  status: 'new' | 'invoiced' | 'active' | 'cancelled';
+  plan: string;
+  screens: number;
+  company: string;
+  name: string;
+  email: string;
+  phone?: string;
+  place?: string;
+  touch?: boolean;
+  note?: string;
+  memo?: string; // 管理者メモ（請求書番号・入金日など）
+  deviceIds?: string[];
+};
+
+const APP_KEY = (id: string) => `app:${id}`;
+const emailOk = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+
+async function listApplications(env: any): Promise<Application[]> {
+  const out: Application[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.NEWS_KV.list({ prefix: 'app:', cursor });
+    for (const k of page.keys) { const v = await env.NEWS_KV.get(k.name, 'json'); if (v) out.push(v); }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor && out.length < 1000);
+  return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+async function notifyApplication(url: string | undefined, a: Application, planName: string) {
+  if (!url) return;
+  const text = `📥 サイネージの申し込みがありました\n${a.company} / ${a.name} 様（${a.email}${a.phone ? ' / ' + a.phone : ''}）\nプラン：${planName} × ${a.screens}画面${a.place ? `\n設置場所：${a.place}` : ''}${a.note ? `\n備考：${a.note}` : ''}`;
+  try {
+    // Slack は text、Discord は content を読む
+    await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, content: text }) });
+  } catch (e) {
+    console.error('notify failed', e);
+  }
+}
+
+// 入金確認後：申し込み内容から端末（サイネージ）を発行する
+function devicesFromApplication(a: Application, months: number) {
+  const paidUntil = addMonths(todayJst(), months);
+  const ownerKey = rid() + rid() + rid();
+  return Array.from({ length: Math.max(1, Math.min(50, a.screens)) }, (_, i) => ({
+    id: rid().slice(0, 8),
+    name: `${a.company}${a.screens > 1 ? ` ${i + 1}` : ''}`.slice(0, 80),
+    key: rid() + rid(),
+    active: true,
+    ...sanitizeDeviceExtras({ plan: a.plan, paidUntil, ownerKey: a.screens > 1 ? rid() + rid() + rid() : ownerKey, contact: `${a.name} <${a.email}>`, touch: a.touch !== false, mode: 'news' })
+  }));
+}
+
+export const addMonths = (d: string, n: number) => {
+  const t = new Date(Date.parse(d + 'T00:00:00Z'));
+  const day = t.getUTCDate();
+  t.setUTCMonth(t.getUTCMonth() + n);
+  if (t.getUTCDate() !== day) t.setUTCDate(0); // 1/31 + 1ヶ月 → 2/28
+  return t.toISOString().slice(0, 10);
+};
+
 // ====================== Stripe ======================
 async function stripeGet(env: any, path: string) {
   const res = await fetch(`https://api.stripe.com/v1/${path}`, { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } });
@@ -562,6 +626,46 @@ export async function handleEngage(request: Request, env: any, ctx: any, url: UR
       survey: survey ? publicSurvey(survey) : null,
       localItems: dev.localItems || [],
       localNews: crawled.slice(0, 15)
+    });
+  }
+
+  // サイネージの申し込み（振込）：内容を保存して管理者に通知し、振込先を返す
+  if (path === '/api/signage/apply' && request.method === 'POST') {
+    const b: any = await body();
+    const cfg = await loadConfig(env);
+    const plans = cfg.settings.signagePlans || DEFAULT_PLANS;
+    const plan = plans.find(p => p.id === b?.plan) || plans[0];
+    const a: Application = {
+      id: `${Date.now().toString(36)}-${rid().slice(0, 4)}`,
+      createdAt: new Date().toISOString(),
+      status: 'new',
+      plan: plan.id,
+      screens: Math.min(100, Math.max(1, parseInt(b?.screens, 10) || 1)),
+      company: str(b?.company, 80),
+      name: str(b?.name, 40),
+      email: str(b?.email, 120),
+      phone: str(b?.phone, 30) || undefined,
+      place: str(b?.place, 120) || undefined,
+      touch: b?.touch !== false,
+      note: str(b?.note, 600) || undefined
+    };
+    if (!a.company || !a.name || !emailOk(a.email)) return json({ error: '会社名・お名前・メールアドレスを正しく入力してください' }, 400);
+    if (str(b?.website, 100)) return json({ ok: true }); // ボット対策（見えない入力欄に値があれば保存しない）
+    const ip = request.headers.get('CF-Connecting-IP') || 'x';
+    const rl = `aprl:${ip}:${todayJst()}`;
+    const n = parseInt((await env.NEWS_KV.get(rl)) || '0', 10);
+    if (n >= 5) return json({ error: '本日の申し込み回数の上限に達しました。お問い合わせからご連絡ください' }, 429);
+    await env.NEWS_KV.put(rl, String(n + 1), { expirationTtl: 2 * 86400 });
+    await env.NEWS_KV.put(APP_KEY(a.id), JSON.stringify(a), { expirationTtl: 3 * 365 * 86400 });
+    ctx?.waitUntil?.(notifyApplication(cfg.settings.applyNotifyUrl, a, plan.name));
+    ctx?.waitUntil?.(track(env, 'signage_contract', `apply-${plan.id}`));
+    return json({
+      ok: true,
+      id: a.id,
+      plan: { id: plan.id, name: plan.name, price: plan.price, interval: plan.interval },
+      total: plan.price * a.screens,
+      bankInfo: cfg.settings.bankInfo || null,
+      invoiceNote: cfg.settings.invoiceNote || null
     });
   }
 
@@ -663,7 +767,10 @@ export async function handleEngage(request: Request, env: any, ctx: any, url: UR
     if (path === '/api/owner/device' && request.method === 'GET') {
       const aggs: Record<string, any> = {};
       for (const s of mine) aggs[s.id] = (await env.NEWS_KV.get(`agg:${s.id}`, 'json')) || { total: 0, q: {} };
-      return json({ device: dev, active: deviceActive(dev), features, surveys: mine, aggs, plans: cfg.settings.signagePlans || DEFAULT_PLANS });
+      return json({
+        device: dev, active: deviceActive(dev), features, surveys: mine, aggs, plans: cfg.settings.signagePlans || DEFAULT_PLANS,
+        payment: { mode: cfg.settings.paymentMode || 'bank', bankInfo: dev.stripeSub ? null : cfg.settings.bankInfo || null }
+      });
     }
     if (path === '/api/owner/device' && request.method === 'PUT') {
       const b: any = await body();
@@ -699,8 +806,36 @@ export async function handleEngage(request: Request, env: any, ctx: any, url: UR
   }
 
   // ---------- 管理API（biz.ts と同じ ADMIN_TOKEN） ----------
-  if (path.startsWith('/api/admin/') && ['/api/admin/survey/export', '/api/admin/survey/agg', '/api/admin/claim', '/api/admin/local/crawl', '/api/admin/quiz/generate'].includes(path)) {
+  if (path.startsWith('/api/admin/') && ['/api/admin/survey/export', '/api/admin/survey/agg', '/api/admin/claim', '/api/admin/local/crawl', '/api/admin/quiz/generate', '/api/admin/applications', '/api/admin/applications/update', '/api/admin/applications/activate'].includes(path)) {
     if (!env.ADMIN_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.ADMIN_TOKEN}`) return json({ error: 'unauthorized' }, 401);
+    if (path === '/api/admin/applications') return json({ applications: await listApplications(env) });
+    if (path === '/api/admin/applications/update' && request.method === 'POST') {
+      const b: any = await body();
+      const a: Application | null = await env.NEWS_KV.get(APP_KEY(str(b?.id, 40)), 'json');
+      if (!a) return json({ error: 'not found' }, 404);
+      if (['new', 'invoiced', 'cancelled'].includes(b?.status)) a.status = b.status;
+      if (typeof b?.memo === 'string') a.memo = str(b.memo, 300);
+      await env.NEWS_KV.put(APP_KEY(a.id), JSON.stringify(a), { expirationTtl: 3 * 365 * 86400 });
+      return json({ application: a });
+    }
+    if (path === '/api/admin/applications/activate' && request.method === 'POST') {
+      // 入金を確認したら押す：端末を発行して申し込みを「有効」にする
+      const b: any = await body();
+      const a: Application | null = await env.NEWS_KV.get(APP_KEY(str(b?.id, 40)), 'json');
+      if (!a) return json({ error: 'not found' }, 404);
+      if (a.status === 'active') return json({ error: 'この申し込みはすでに有効化されています' }, 409);
+      const months = Math.min(24, Math.max(1, parseInt(b?.months, 10) || 1));
+      const cfg = await loadConfig(env, true);
+      const devs = devicesFromApplication(a, months);
+      cfg.devices.unshift(...(devs as any[]));
+      await saveConfig(env, cfg);
+      a.status = 'active';
+      a.deviceIds = devs.map(d => d.id);
+      a.memo = [a.memo, `${todayJst()} 入金確認・${months}ヶ月分で有効化`].filter(Boolean).join(' / ').slice(0, 300);
+      await env.NEWS_KV.put(APP_KEY(a.id), JSON.stringify(a), { expirationTtl: 3 * 365 * 86400 });
+      ctx?.waitUntil?.(track(env, 'signage_contract', a.plan));
+      return json({ application: a, devices: devs.map(d => ({ id: d.id, name: d.name, key: d.key, ownerKey: d.ownerKey, paidUntil: d.paidUntil })), rev: cfg.rev });
+    }
     if (path === '/api/admin/survey/export') return json({ rows: await exportResponses(env, str(url.searchParams.get('id'), 40)) });
     if (path === '/api/admin/survey/agg') return json((await env.NEWS_KV.get(`agg:${str(url.searchParams.get('id'), 40)}`, 'json')) || { total: 0, q: {} });
     if (path === '/api/admin/claim') return claimCheck(env, json, str(url.searchParams.get('code'), 10).toUpperCase(), request.method === 'POST');

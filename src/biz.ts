@@ -38,6 +38,10 @@ export type Settings = {
   contactUrl?: string; // 企業・自治体向け問い合わせ先
   signagePlans?: SignagePlan[]; // サイネージの料金プラン（LP と申し込みに使う）
   localTopics?: LocalTopic[]; // 地域ごとのローカルニュース収集キーワード
+  paymentMode?: 'bank' | 'stripe'; // サイネージの支払い方法（当面は振込＝手動で有効化）
+  bankInfo?: string; // 振込先・お支払い案内（申し込み完了画面・契約者画面に表示）
+  applyNotifyUrl?: string; // 申し込みがあったときに通知する Webhook（Slack / Discord）
+  invoiceNote?: string; // 申し込み完了画面に出す補足（例：請求書を3営業日以内にお送りします）
 };
 export type BizConfig = { placements: Placement[]; partners: Partner[]; devices: Device[]; settings: Settings; surveys: Survey[]; rev?: string };
 
@@ -47,7 +51,7 @@ const DEFAULT_CFG: BizConfig = {
   partners: [],
   devices: [],
   surveys: [],
-  settings: { premiumEnabled: true, premiumPrice: '月額 300円', premiumDays: 31, signagePlans: DEFAULT_PLANS, localTopics: [] }
+  settings: { premiumEnabled: true, premiumPrice: '月額 300円', premiumDays: 31, signagePlans: DEFAULT_PLANS, localTopics: [], paymentMode: 'bank' }
 };
 
 export const EVENT_KINDS = new Set([
@@ -155,6 +159,10 @@ export function sanitizeConfig(input: any): BizConfig {
     premiumDays: Math.min(366, Math.max(1, parseInt(s.premiumDays, 10) || 31)),
     contactUrl: /^(https:\/\/|mailto:)/.test(str(s.contactUrl, 300)) ? str(s.contactUrl, 300) : undefined,
     signagePlans: sanitizePlans(s.signagePlans),
+    paymentMode: s.paymentMode === 'stripe' ? 'stripe' : 'bank',
+    bankInfo: str(s.bankInfo, 600) || undefined,
+    applyNotifyUrl: /^https:\/\/[^\s]+$/.test(str(s.applyNotifyUrl, 500)) ? str(s.applyNotifyUrl, 500) : undefined,
+    invoiceNote: str(s.invoiceNote, 300) || undefined,
     localTopics: sanitizeTopics(s.localTopics)
   };
   const surveys = (Array.isArray(input?.surveys) ? input.surveys : []).slice(0, 100).map((x: any) => sanitizeSurvey(x)).filter(Boolean) as Survey[];
@@ -271,7 +279,9 @@ export async function handleBiz(request: Request, env: any, ctx: any, url: URL, 
         placements: livePlacements(cfg).map(({ keywords, ...p }) => ({ ...p, keywords: keywords || [] })),
         premium: { enabled: s.premiumEnabled, linkUrl: s.premiumLinkUrl, price: s.premiumPrice, stripe: !!env.STRIPE_SECRET_KEY },
         contactUrl: s.contactUrl,
-        signagePlans: (s.signagePlans || DEFAULT_PLANS).map(p => ({ ...p, linkUrl: p.linkUrl })),
+        // 振込モードでは Stripe の支払いリンクを公開しない（申し込みフォームを使う）
+        signagePlans: (s.signagePlans || DEFAULT_PLANS).map(p => ({ ...p, linkUrl: s.paymentMode === 'stripe' ? p.linkUrl : undefined })),
+        paymentMode: s.paymentMode === 'stripe' ? 'stripe' : 'bank',
         localRegions: (s.localTopics || []).map(t => t.region)
       },
       200,
