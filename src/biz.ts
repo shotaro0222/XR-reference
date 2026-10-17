@@ -10,6 +10,8 @@
 // - 集計 … D1（任意）に日別の表示・タップ数を保存し、スポンサー／自治体へのレポートに使う
 // - 3Dアセット … R2 に GLB を保存して /assets/ から配信
 
+import { DEFAULT_PLANS, LocalTopic, sanitizeDeviceExtras, sanitizePlans, sanitizeSurvey, sanitizeTopics, SignagePlan, Survey } from './engage';
+
 export type Placement = {
   id: string;
   type: 'sponsor' | 'local';
@@ -27,28 +29,32 @@ export type Placement = {
   endAt?: string;
 };
 export type Partner = { id: string; name: string; domains: string[]; active: boolean; plan?: string; note?: string };
-export type Device = { id: string; name: string; key: string; active: boolean; region?: string };
+export type Device = { id: string; name: string; key: string; active: boolean; region?: string; [extra: string]: any };
 export type Settings = {
   premiumEnabled: boolean;
   premiumLinkUrl?: string; // Stripe Payment Link（成功時URLに ?premium_session={CHECKOUT_SESSION_ID} を設定）
   premiumPrice?: string; // 表示用（例：月額 300円）
   premiumDays?: number; // 単発購入・コードの有効日数の既定値
   contactUrl?: string; // 企業・自治体向け問い合わせ先
+  signagePlans?: SignagePlan[]; // サイネージの料金プラン（LP と申し込みに使う）
+  localTopics?: LocalTopic[]; // 地域ごとのローカルニュース収集キーワード
 };
-export type BizConfig = { placements: Placement[]; partners: Partner[]; devices: Device[]; settings: Settings };
+export type BizConfig = { placements: Placement[]; partners: Partner[]; devices: Device[]; settings: Settings; surveys: Survey[]; rev?: string };
 
 const CFG_KEY = 'cfg:v1';
 const DEFAULT_CFG: BizConfig = {
   placements: [],
   partners: [],
   devices: [],
-  settings: { premiumEnabled: true, premiumPrice: '月額 300円', premiumDays: 31 }
+  surveys: [],
+  settings: { premiumEnabled: true, premiumPrice: '月額 300円', premiumDays: 31, signagePlans: DEFAULT_PLANS, localTopics: [] }
 };
 
 export const EVENT_KINDS = new Set([
   'sponsor_impression', 'sponsor_open', 'sponsor_link',
   'local_impression', 'local_open', 'local_link',
-  'photo', 'embed_view', 'embed_play', 'signage_play', 'signage_talk', 'premium_activate'
+  'photo', 'embed_view', 'embed_play', 'signage_play', 'signage_talk', 'premium_activate',
+  'survey_complete', 'quiz_play', 'signage_contract', 'lp_cta'
 ]);
 
 type Deps = {
@@ -63,20 +69,24 @@ type Deps = {
 // ---------------- 設定 ----------------
 let cfgCache: { at: number; cfg: BizConfig } | null = null;
 
-export async function loadConfig(env: any): Promise<BizConfig> {
-  if (cfgCache && Date.now() - cfgCache.at < 30_000) return cfgCache.cfg;
+// fresh=true は書き換え前提の読み込み（キャッシュを使わない）
+export async function loadConfig(env: any, fresh = false): Promise<BizConfig> {
+  if (!fresh && cfgCache && Date.now() - cfgCache.at < 30_000) return cfgCache.cfg;
   const stored = (await env.NEWS_KV.get(CFG_KEY, 'json')) as Partial<BizConfig> | null;
   const cfg: BizConfig = {
     placements: stored?.placements || [],
     partners: stored?.partners || [],
     devices: stored?.devices || [],
-    settings: { ...DEFAULT_CFG.settings, ...(stored?.settings || {}) }
+    surveys: stored?.surveys || [],
+    settings: { ...DEFAULT_CFG.settings, ...(stored?.settings || {}) },
+    rev: stored?.rev
   };
   cfgCache = { at: Date.now(), cfg };
   return cfg;
 }
 
-async function saveConfig(env: any, cfg: BizConfig) {
+export async function saveConfig(env: any, cfg: BizConfig) {
+  cfg.rev = new Date().toISOString(); // サイネージはこの値の変化で表示を切り替える
   await env.NEWS_KV.put(CFG_KEY, JSON.stringify(cfg));
   cfgCache = { at: Date.now(), cfg };
 }
@@ -133,7 +143,8 @@ export function sanitizeConfig(input: any): BizConfig {
       name: str(d.name, 80),
       key: slug(d.key) || crypto.randomUUID().replace(/-/g, ''),
       active: !!d.active,
-      region: str(d.region, 40) || undefined
+      region: str(d.region, 40) || undefined,
+      ...sanitizeDeviceExtras(d)
     }))
     .filter((d: Device) => d.name);
   const s = input?.settings || {};
@@ -142,9 +153,15 @@ export function sanitizeConfig(input: any): BizConfig {
     premiumLinkUrl: /^https:\/\//.test(str(s.premiumLinkUrl, 500)) ? str(s.premiumLinkUrl, 500) : undefined,
     premiumPrice: str(s.premiumPrice, 40) || undefined,
     premiumDays: Math.min(366, Math.max(1, parseInt(s.premiumDays, 10) || 31)),
-    contactUrl: /^(https:\/\/|mailto:)/.test(str(s.contactUrl, 300)) ? str(s.contactUrl, 300) : undefined
+    contactUrl: /^(https:\/\/|mailto:)/.test(str(s.contactUrl, 300)) ? str(s.contactUrl, 300) : undefined,
+    signagePlans: sanitizePlans(s.signagePlans),
+    localTopics: sanitizeTopics(s.localTopics)
   };
-  return { placements, partners, devices, settings };
+  const surveys = (Array.isArray(input?.surveys) ? input.surveys : []).slice(0, 100).map((x: any) => sanitizeSurvey(x)).filter(Boolean) as Survey[];
+  // 同じキーの端末が重複しないように
+  const seen = new Set<string>();
+  const uniqDevices = devices.filter(d => (seen.has(d.key) ? false : (seen.add(d.key), true)));
+  return { placements, partners, devices: uniqDevices, settings, surveys };
 }
 
 export async function findDevice(env: any, key: string): Promise<Device | undefined> {
@@ -253,7 +270,9 @@ export async function handleBiz(request: Request, env: any, ctx: any, url: URL, 
       {
         placements: livePlacements(cfg).map(({ keywords, ...p }) => ({ ...p, keywords: keywords || [] })),
         premium: { enabled: s.premiumEnabled, linkUrl: s.premiumLinkUrl, price: s.premiumPrice, stripe: !!env.STRIPE_SECRET_KEY },
-        contactUrl: s.contactUrl
+        contactUrl: s.contactUrl,
+        signagePlans: (s.signagePlans || DEFAULT_PLANS).map(p => ({ ...p, linkUrl: p.linkUrl })),
+        localRegions: (s.localTopics || []).map(t => t.region)
       },
       200,
       { 'Cache-Control': 'public, max-age=60' }
@@ -358,11 +377,16 @@ export async function handleBiz(request: Request, env: any, ctx: any, url: URL, 
     if (!env.ADMIN_TOKEN || auth !== `Bearer ${env.ADMIN_TOKEN}`) return json({ error: 'unauthorized' }, 401);
 
     if (path === '/api/admin/config' && request.method === 'GET') {
-      return json({ ...(await loadConfig(env)), features: { stats: !!env.DB, assets: !!env.BUCKET, stripe: !!env.STRIPE_SECRET_KEY } });
+      return json({ ...(await loadConfig(env, true)), features: { stats: !!env.DB, assets: !!env.BUCKET, stripe: !!env.STRIPE_SECRET_KEY } });
     }
     if (path === '/api/admin/config' && request.method === 'PUT') {
-      const body = await request.json().catch(() => null);
+      const body: any = await request.json().catch(() => null);
       if (!body) return json({ error: 'invalid json' }, 400);
+      // 画面を開いている間に、Stripe 申し込み・契約者画面で設定が変わっていたら上書きしない
+      const current = await loadConfig(env, true);
+      if (current.rev && body.rev && body.rev !== current.rev) {
+        return json({ error: '管理画面を開いた後に、申し込みや契約者の編集で設定が更新されました。再読み込みしてからもう一度保存してください' }, 409);
+      }
       const cfg = sanitizeConfig(body);
       await saveConfig(env, cfg);
       return json(cfg);
@@ -404,7 +428,7 @@ export async function handleBiz(request: Request, env: any, ctx: any, url: URL, 
       }
       return json({ codes, days, uses });
     }
-    return json({ error: 'Not Found' }, 404);
+    return null; // サーベイ・クイズなどの管理APIは engage.ts で処理
   }
 
   return null;

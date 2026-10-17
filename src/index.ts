@@ -1,4 +1,5 @@
 import { handleBiz, findDevice, localContext, loadConfig, livePlacements, track } from './biz';
+import { crawlLocal, generateQuizzes, handleEngage } from './engage';
 
 // (前半のimport、定数、パース関数、AI要約関数はいただいたコードと同じため省略せずそのまま記述します)
 const DATA_VERSION = 5;
@@ -555,9 +556,16 @@ const corsHeaders = {
 const json = (body: any, status = 200, extra: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, ...extra } });
 
+const engageDeps = () => ({ json, loadRaw, fetchFeed, isAllowedByRobots, aiText, hashKey, model: DEFAULT_MODEL });
+
 export default {
   async scheduled(_event: any, env: any, ctx: any) {
-    const p = refreshNews(env, WARM_ON_CRON);
+    const p = (async () => {
+      await refreshNews(env, WARM_ON_CRON);
+      // ニュースが更新されたら、クイズの補充とローカルニュースの収集もまとめて行う
+      await generateQuizzes(env, ctx, engageDeps(), 2).catch(e => console.error('quiz', e));
+      await crawlLocal(env, ctx, engageDeps()).catch(e => console.error('local', e));
+    })();
     ctx?.waitUntil?.(p);
     await p;
   },
@@ -569,6 +577,10 @@ export default {
     // 掲載枠・提携メディア・プレミアム・集計・管理API（src/biz.ts）
     const biz = await handleBiz(request, env, ctx, url, { json, corsHeaders, extractArticle, summarize, hashKey, UA });
     if (biz) return biz;
+
+    // サーベイ・有料サイネージ・クイズ・ローカル収集（src/engage.ts）
+    const engage = await handleEngage(request, env, ctx, url, engageDeps());
+    if (engage) return engage;
 
     if (url.pathname === '/api/news') {
       const raw = await loadRaw(env, ctx);
