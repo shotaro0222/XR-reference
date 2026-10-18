@@ -250,6 +250,49 @@ function randomCode() {
   return `${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(8, 12)}`;
 }
 
+// ---------------- 管理者（メールアドレス＋パスワードでログイン） ----------------
+// 管理者のメールアドレスは wrangler.toml の ADMIN_EMAILS（カンマ区切り）で変更できる
+const DEFAULT_ADMIN_EMAILS = 'shotaro6022@gmail.com';
+export const adminEmails = (env: any) =>
+  String(env.ADMIN_EMAILS || DEFAULT_ADMIN_EMAILS).split(/[,\s]+/).map(e => e.trim().toLowerCase()).filter(Boolean);
+
+function safeEqual(a: string, b: string) {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+async function sessionKey(env: any) {
+  const secret = env.SESSION_SECRET || env.ADMIN_TOKEN;
+  if (!secret) throw new Error('ADMIN_TOKEN is not set');
+  return crypto.subtle.importKey('raw', new TextEncoder().encode(`admin-session:${secret}`), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+
+async function signSession(env: any, email: string) {
+  const body = b64u(new TextEncoder().encode(JSON.stringify({ email, exp: Date.now() + 30 * 86400_000 })));
+  const sig = await crypto.subtle.sign('HMAC', await sessionKey(env), new TextEncoder().encode(body));
+  return `adm.${body}.${b64u(sig)}`;
+}
+
+// 管理者として扱うか：ログインで発行したセッション、または ADMIN_TOKEN そのもの（従来どおり）
+export async function adminFrom(request: Request, env: any): Promise<string | null> {
+  if (!env.ADMIN_TOKEN) return null;
+  const auth = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/, '');
+  if (!auth) return null;
+  if (safeEqual(auth, env.ADMIN_TOKEN)) return 'token';
+  const [prefix, body, sig] = auth.split('.');
+  if (prefix !== 'adm' || !body || !sig) return null;
+  try {
+    const ok = await crypto.subtle.verify('HMAC', await sessionKey(env), b64uDecode(sig), new TextEncoder().encode(body));
+    if (!ok) return null;
+    const p = JSON.parse(new TextDecoder().decode(b64uDecode(body)));
+    return p.exp > Date.now() && adminEmails(env).includes(String(p.email).toLowerCase()) ? p.email : null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------- ルーティング ----------------
 export async function handleBiz(request: Request, env: any, ctx: any, url: URL, d: Deps): Promise<Response | null> {
   const { json } = d;
@@ -381,10 +424,27 @@ export async function handleBiz(request: Request, env: any, ctx: any, url: URL, 
     }
   }
 
+  // ---------- 管理者ログイン ----------
+  if (path === '/api/admin/login' && request.method === 'POST') {
+    if (!env.ADMIN_TOKEN) return json({ error: 'サーバーに ADMIN_TOKEN が設定されていません' }, 503);
+    const ip = request.headers.get('CF-Connecting-IP') || 'x';
+    const rlKey = `adml:${ip}:${Math.floor(Date.now() / 900_000)}`;
+    const fails = parseInt((await env.NEWS_KV.get(rlKey)) || '0', 10);
+    if (fails >= 8) return json({ error: 'ログインの失敗が続いたため、15分ほど待ってからお試しください' }, 429);
+    const body: any = await request.json().catch(() => null);
+    const email = str(body?.email, 120).toLowerCase();
+    const password = typeof body?.password === 'string' ? body.password : '';
+    if (!adminEmails(env).includes(email) || !safeEqual(password, env.ADMIN_TOKEN)) {
+      await env.NEWS_KV.put(rlKey, String(fails + 1), { expirationTtl: 1000 });
+      return json({ error: 'メールアドレスまたはパスワードが違います' }, 401);
+    }
+    return json({ token: await signSession(env, email), email, expiresInDays: 30 });
+  }
+
   // ---------- 管理API ----------
   if (path.startsWith('/api/admin/')) {
-    const auth = request.headers.get('Authorization') || '';
-    if (!env.ADMIN_TOKEN || auth !== `Bearer ${env.ADMIN_TOKEN}`) return json({ error: 'unauthorized' }, 401);
+    if (!(await adminFrom(request, env))) return json({ error: 'unauthorized' }, 401);
+    if (path === '/api/admin/me') return json({ email: await adminFrom(request, env) });
 
     if (path === '/api/admin/config' && request.method === 'GET') {
       return json({ ...(await loadConfig(env, true)), features: { stats: !!env.DB, assets: !!env.BUCKET, stripe: !!env.STRIPE_SECRET_KEY } });

@@ -7,7 +7,7 @@
 //
 // 設定はすべて biz.ts の cfg:v1（KV）に入れ、管理画面と契約者画面から編集する。
 
-import { BizConfig, loadConfig, saveConfig, track } from './biz';
+import { adminFrom, BizConfig, loadConfig, saveConfig, track } from './biz';
 
 // ====================== 型 ======================
 export type Opt = { id: string; label: string };
@@ -606,6 +606,32 @@ export async function handleEngage(request: Request, env: any, ctx: any, url: UR
     return json((await env.NEWS_KV.get(`agg:${s.id}`, 'json')) || { total: 0, q: {} }, 200, { 'Cache-Control': 'public, max-age=15' });
   }
 
+  // ---------- 管理者のサイネージプレビュー（契約・端末なしで全モードを確認） ----------
+  if (path === '/api/signage/preview') {
+    if (!(await adminFrom(request, env))) return json({ active: false, reason: 'admin' }, 401);
+    const cfg = await loadConfig(env, true);
+    const q = url.searchParams;
+    const mode = ['news', 'survey', 'quiz', 'mix'].includes(q.get('mode') || '') ? q.get('mode') : 'mix';
+    const region = str(q.get('region'), 40) || undefined;
+    const surveyId = str(q.get('survey'), 40);
+    const survey = (cfg.surveys || []).find(s => s.id === surveyId) || (cfg.surveys || []).find(s => s.active) || null;
+    const topicIds = (cfg.settings.localTopics || []).filter(t => !region || t.region === region).map(t => t.id);
+    const crawled: LocalNews[] = [];
+    for (const t of topicIds) for (const it of await localNewsFor(env, ctx, d, t)) if (!crawled.some(c => c.url === it.url)) crawled.push(it);
+    return json({
+      active: true,
+      preview: true,
+      rev: `${cfg.rev || ''}|${mode}|${q.get('touch')}|${survey?.id || ''}|${region || ''}`,
+      device: { id: 'preview', name: '管理者プレビュー', region, touch: q.get('touch') !== '0', mode, plan: 'internal' },
+      features: PLAN_FEATURES.internal,
+      survey: survey ? publicSurvey(survey) : null,
+      surveys: (cfg.surveys || []).map(s => ({ id: s.id, title: s.title, active: s.active })),
+      regions: [...new Set([...(cfg.settings.localTopics || []).map(t => t.region), ...cfg.devices.map(x => x.region).filter(Boolean)])],
+      localItems: [],
+      localNews: crawled.slice(0, 15)
+    });
+  }
+
   // ---------- サイネージの状態（端末が20秒ごとに取得） ----------
   if (path === '/api/signage/state') {
     const cfg = await loadConfig(env, true);
@@ -805,9 +831,9 @@ export async function handleEngage(request: Request, env: any, ctx: any, url: UR
     return json({ error: 'Not Found' }, 404);
   }
 
-  // ---------- 管理API（biz.ts と同じ ADMIN_TOKEN） ----------
+  // ---------- 管理API（biz.ts と同じ管理者認証） ----------
   if (path.startsWith('/api/admin/') && ['/api/admin/survey/export', '/api/admin/survey/agg', '/api/admin/claim', '/api/admin/local/crawl', '/api/admin/quiz/generate', '/api/admin/applications', '/api/admin/applications/update', '/api/admin/applications/activate'].includes(path)) {
-    if (!env.ADMIN_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.ADMIN_TOKEN}`) return json({ error: 'unauthorized' }, 401);
+    if (!(await adminFrom(request, env))) return json({ error: 'unauthorized' }, 401);
     if (path === '/api/admin/applications') return json({ applications: await listApplications(env) });
     if (path === '/api/admin/applications/update' && request.method === 'POST') {
       const b: any = await body();
