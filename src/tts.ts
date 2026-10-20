@@ -14,6 +14,7 @@ const API = 'https://api.elevenlabs.io';
 const MAX_TEXT = 400;
 const RATE_PER_HOUR = 400; // 1IP あたり、キャッシュにない文章の生成回数
 const OUTPUT = 'mp3_44100_64';
+const rl = { hour: 0, counts: new Map<string, number>() };
 export const TTS_MODELS = ['eleven_flash_v2_5', 'eleven_turbo_v2_5', 'eleven_multilingual_v2', 'eleven_v3'];
 const DEFAULT_MODEL = 'eleven_flash_v2_5';
 const DEFAULT_ORIGINS = ['https://newssummoner.com', 'https://www.newssummoner.com', 'http://localhost:3000'];
@@ -91,12 +92,14 @@ async function getAudio(env: any, d: Deps, text: string, opt: { voiceId: string;
   const hit = env.BUCKET ? await env.BUCKET.get(key) : null;
   if (hit) return { body: hit.body as ReadableStream | ArrayBuffer, cached: true };
 
+  // 回数制限はメモリ上で行う（KV の書き込みは無料枠が1日1,000回と少ないため使わない）
   if (request) {
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-    const rk = `rl:tts:${ip}:${Math.floor(Date.now() / 3600000)}`;
-    const n = parseInt((await env.NEWS_KV.get(rk)) || '0', 10);
-    if (n >= RATE_PER_HOUR) return { error: 'rate limited', status: 429 };
-    await env.NEWS_KV.put(rk, String(n + 1), { expirationTtl: 3700 });
+    const hour = Math.floor(Date.now() / 3600000);
+    if (rl.hour !== hour) { rl.hour = hour; rl.counts.clear(); }
+    const n = (rl.counts.get(ip) || 0) + 1;
+    rl.counts.set(ip, n);
+    if (n > RATE_PER_HOUR) return { error: 'rate limited', status: 429 };
   }
   const usedKey = `tts:chars:${month()}`;
   const used = parseInt((await env.NEWS_KV.get(usedKey)) || '0', 10);
