@@ -42,6 +42,10 @@ export type Settings = {
   bankInfo?: string; // 振込先・お支払い案内（申し込み完了画面・契約者画面に表示）
   applyNotifyUrl?: string; // 申し込みがあったときに通知する Webhook（Slack / Discord）
   invoiceNote?: string; // 申し込み完了画面に出す補足（例：請求書を3営業日以内にお送りします）
+  ttsEnabled?: boolean; // ElevenLabs の声で読み上げる（ELEVENLABS_API_KEY が必要）
+  ttsVoiceId?: string;
+  ttsModel?: string;
+  ttsMonthlyLimit?: number; // 1か月に新しく生成する文字数の上限（0 = 上限なし）
 };
 export type BizConfig = { placements: Placement[]; partners: Partner[]; devices: Device[]; settings: Settings; surveys: Survey[]; rev?: string };
 
@@ -163,7 +167,11 @@ export function sanitizeConfig(input: any): BizConfig {
     bankInfo: str(s.bankInfo, 600) || undefined,
     applyNotifyUrl: /^https:\/\/[^\s]+$/.test(str(s.applyNotifyUrl, 500)) ? str(s.applyNotifyUrl, 500) : undefined,
     invoiceNote: str(s.invoiceNote, 300) || undefined,
-    localTopics: sanitizeTopics(s.localTopics)
+    localTopics: sanitizeTopics(s.localTopics),
+    ttsEnabled: s.ttsEnabled !== false,
+    ttsVoiceId: str(s.ttsVoiceId, 60).replace(/[^A-Za-z0-9_-]/g, '') || undefined,
+    ttsModel: str(s.ttsModel, 40) || undefined,
+    ttsMonthlyLimit: Math.min(100_000_000, Math.max(0, parseInt(s.ttsMonthlyLimit, 10) || 0))
   };
   const surveys = (Array.isArray(input?.surveys) ? input.surveys : []).slice(0, 100).map((x: any) => sanitizeSurvey(x)).filter(Boolean) as Survey[];
   // 同じキーの端末が重複しないように

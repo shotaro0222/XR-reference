@@ -33,3 +33,4 @@ crons = ["0 20 * * *", "0 8 * * *"]
 #   npx wrangler secret put ADMIN_TOKEN        … /admin のログイン用（必須）
 #   npx wrangler secret put PREMIUM_SECRET     … プレミアム証明の署名用（推奨。未設定時は ADMIN_TOKEN を使用）
 #   npx wrangler secret put STRIPE_SECRET_KEY  … Stripe で販売する場合のみ
+#   npx wrangler secret put ELEVENLABS_API_KEY … アバターの声を ElevenLabs にする場合（声は /admin で選ぶ）

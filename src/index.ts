@@ -1,5 +1,6 @@
 import { handleBiz, findDevice, localContext, loadConfig, livePlacements, track } from './biz';
 import { crawlLocal, generateQuizzes, handleEngage } from './engage';
+import { handleTts } from './tts';
 
 // (前半のimport、定数、パース関数、AI要約関数はいただいたコードと同じため省略せずそのまま記述します)
 const DATA_VERSION = 5;
@@ -573,6 +574,10 @@ export default {
   async fetch(request: Request, env: any, ctx: any) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
+
+    // 読み上げ音声（ElevenLabs、src/tts.ts）
+    const tts = await handleTts(request, env, ctx, url, { json, corsHeaders, hashKey });
+    if (tts) return tts;
 
     // 掲載枠・提携メディア・プレミアム・集計・管理API（src/biz.ts）
     const biz = await handleBiz(request, env, ctx, url, { json, corsHeaders, extractArticle, summarize, hashKey, UA });
