@@ -47,7 +47,9 @@ export type Settings = {
   ttsModel?: string;
   ttsMonthlyLimit?: number; // 1か月に新しく生成する文字数の上限（0 = 上限なし）
 };
-export type BizConfig = { placements: Placement[]; partners: Partner[]; devices: Device[]; settings: Settings; surveys: Survey[]; rev?: string };
+// サーベイの依頼主（レポートを見せる相手）。reportKey を知っている人だけがレポートURLを開ける
+export type Client = { id: string; name: string; contact?: string; note?: string; reportKey: string };
+export type BizConfig = { placements: Placement[]; partners: Partner[]; devices: Device[]; settings: Settings; surveys: Survey[]; clients?: Client[]; rev?: string };
 
 const CFG_KEY = 'cfg:v1';
 const DEFAULT_CFG: BizConfig = {
@@ -55,6 +57,7 @@ const DEFAULT_CFG: BizConfig = {
   partners: [],
   devices: [],
   surveys: [],
+  clients: [],
   settings: { premiumEnabled: true, premiumPrice: '月額 300円', premiumDays: 31, signagePlans: DEFAULT_PLANS, localTopics: [], paymentMode: 'bank' }
 };
 
@@ -86,6 +89,7 @@ export async function loadConfig(env: any, fresh = false): Promise<BizConfig> {
     partners: stored?.partners || [],
     devices: stored?.devices || [],
     surveys: stored?.surveys || [],
+    clients: stored?.clients || [],
     settings: { ...DEFAULT_CFG.settings, ...(stored?.settings || {}) },
     rev: stored?.rev
   };
@@ -173,12 +177,25 @@ export function sanitizeConfig(input: any): BizConfig {
     ttsModel: str(s.ttsModel, 40) || undefined,
     ttsMonthlyLimit: Math.min(100_000_000, Math.max(0, parseInt(s.ttsMonthlyLimit, 10) || 0))
   };
-  const surveys = (Array.isArray(input?.surveys) ? input.surveys : []).slice(0, 100).map((x: any) => sanitizeSurvey(x)).filter(Boolean) as Survey[];
+  const clients: Client[] = (Array.isArray(input?.clients) ? input.clients : []).slice(0, 200)
+    .map((c: any): Client => ({
+      id: slug(c?.id) || crypto.randomUUID().slice(0, 8),
+      name: str(c?.name, 80),
+      contact: str(c?.contact, 120) || undefined,
+      note: str(c?.note, 300) || undefined,
+      reportKey: slug(c?.reportKey).length >= 16 ? slug(c.reportKey) : newReportKey()
+    }))
+    .filter((c: Client) => c.name);
+  const clientIds = new Set(clients.map(c => c.id));
+  const surveys = (Array.isArray(input?.surveys) ? input.surveys : []).slice(0, 100).map((x: any) => sanitizeSurvey(x)).filter(Boolean)
+    .map((x: any) => (x.client && !clientIds.has(x.client) ? { ...x, client: undefined } : x)) as Survey[];
   // 同じキーの端末が重複しないように
   const seen = new Set<string>();
   const uniqDevices = devices.filter(d => (seen.has(d.key) ? false : (seen.add(d.key), true)));
-  return { placements, partners, devices: uniqDevices, settings, surveys };
+  return { placements, partners, devices: uniqDevices, settings, surveys, clients };
 }
+
+export const newReportKey = () => crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
 
 export async function findDevice(env: any, key: string): Promise<Device | undefined> {
   if (!key) return undefined;

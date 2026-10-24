@@ -41,9 +41,25 @@ async function settings(env: any) {
   };
 }
 
+// 声の一覧を読めないキー（「Voices」の権限なし）でも読み上げられるよう、ElevenLabs の標準の声を使う
+const FALLBACK_VOICE = 'JBFqnCBsd6RMkjVDRZzb';
+
+// ElevenLabs のエラーを日本語の説明にする
+export function explainError(status: number, body = ''): string {
+  if (/missing_permissions|permission/i.test(body)) {
+    const perm = (body.match(/permission ([a-z_]+)/i) || [])[1];
+    return `API キーに必要な権限がありません${perm ? `（${perm}）` : ''}。ElevenLabs の API キー画面で、このキーの「Text to Speech」と「Voices（読み取り）」をオンにしてください`;
+  }
+  if (/quota_exceeded/i.test(body)) return 'ElevenLabs の今月の文字数（クレジット）を使い切りました。ブラウザの音声で読み上げます';
+  if (/voice_not_found/i.test(body) || status === 404) return '選んだ声が見つかりません。声を選び直してください';
+  if (/invalid_api_key|unauthorized/i.test(body) || status === 401) return 'API キーが正しくないか、無効になっています。キーを発行し直して Cloudflare に登録し直してください';
+  if (/detected_unusual_activity|free_users_not_allowed/i.test(body)) return 'ElevenLabs が無料プランでのこの使い方を制限しています（有料プランが必要です）';
+  return `ElevenLabs のエラー（${status}）${body ? `：${body.slice(0, 150)}` : ''}`;
+}
+
 async function listVoices(env: any): Promise<any[]> {
   const r = await fetch(`${API}/v1/voices`, { headers: { 'xi-api-key': env.ELEVENLABS_API_KEY } });
-  if (!r.ok) throw new Error(`voices ${r.status}`);
+  if (!r.ok) throw new Error(explainError(r.status, await r.text().catch(() => '')));
   const d: any = await r.json();
   return (d?.voices || []).map((v: any) => ({
     id: v.voice_id,
@@ -59,11 +75,16 @@ async function resolveVoice(env: any, voiceId: string): Promise<string> {
   if (voiceId) return voiceId;
   const cached = await env.NEWS_KV.get('tts:default-voice');
   if (cached) return cached;
-  const voices = await listVoices(env);
-  const pick = voices.find(v => /ja|japanese/i.test(`${v.labels?.language || ''} ${v.labels?.accent || ''}`)) || voices[0];
-  if (!pick) throw new Error('no voice');
-  await env.NEWS_KV.put('tts:default-voice', pick.id, { expirationTtl: 86400 });
-  return pick.id;
+  let id = FALLBACK_VOICE;
+  try {
+    const voices = await listVoices(env);
+    const pick = voices.find(v => /ja|japanese/i.test(`${v.labels?.language || ''} ${v.labels?.accent || ''}`)) || voices[0];
+    if (pick) id = pick.id;
+  } catch (e) {
+    console.error('tts voices', e); // 一覧が読めなくても標準の声で続ける
+  }
+  await env.NEWS_KV.put('tts:default-voice', id, { expirationTtl: 86400 });
+  return id;
 }
 
 async function synthesize(env: any, text: string, voiceId: string, model: string): Promise<{ audio?: ArrayBuffer; status: number; error?: string }> {
@@ -108,7 +129,7 @@ async function getAudio(env: any, d: Deps, text: string, opt: { voiceId: string;
   const res = await synthesize(env, text, voiceId, opt.model);
   if (!res.audio) {
     console.error('elevenlabs', res.status, res.error);
-    return { error: 'tts failed', status: 502, detail: res.error };
+    return { error: 'tts failed', status: 502, detail: explainError(res.status, res.error) };
   }
   await env.NEWS_KV.put(usedKey, String(used + text.length), { expirationTtl: 40 * 86400 });
   if (env.BUCKET) await env.BUCKET.put(key, res.audio, { httpMetadata: { contentType: 'audio/mpeg' } });

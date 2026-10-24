@@ -7,7 +7,7 @@
 //
 // 設定はすべて biz.ts の cfg:v1（KV）に入れ、管理画面と契約者画面から編集する。
 
-import { adminFrom, BizConfig, loadConfig, saveConfig, track } from './biz';
+import { adminFrom, BizConfig, Client, loadConfig, saveConfig, track } from './biz';
 
 // ====================== 型 ======================
 export type Opt = { id: string; label: string };
@@ -45,6 +45,7 @@ export type Survey = {
   questions: Question[];
   incentive: Incentive;
   owner?: string; // 契約者（サイネージ端末ID）が作ったサーベイ
+  client?: string; // 依頼主（クライアント）ID。クライアント別レポートに載る
   startAt?: string;
   endAt?: string;
 };
@@ -144,6 +145,7 @@ export function sanitizeSurvey(s: any, owner?: string): Survey | null {
       loseText: str(inc.loseText, 120) || undefined
     },
     owner: owner || (slug(s?.owner) || undefined),
+    client: slug(s?.client) || undefined,
     startAt: /^\d{4}-\d{2}-\d{2}$/.test(s?.startAt) ? s.startAt : undefined,
     endAt: /^\d{4}-\d{2}-\d{2}$/.test(s?.endAt) ? s.endAt : undefined
   };
@@ -269,10 +271,15 @@ export function validateAnswers(s: Survey, input: any): { answers: Record<string
   return { answers: out, ok: Object.keys(out).length > 0 };
 }
 
-type Agg = { total: number; q: Record<string, Record<string, any>>; updated?: string };
+// days：日別の回答数（JST）、dev：設置場所（端末・QR・Web）別の回答数
+type Agg = { total: number; q: Record<string, Record<string, any>>; days?: Record<string, number>; dev?: Record<string, number>; first?: string; updated?: string };
 
-function addToAgg(agg: Agg, s: Survey, answers: Record<string, any>) {
+function addToAgg(agg: Agg, s: Survey, answers: Record<string, any>, device = '', created = new Date().toISOString()) {
   agg.total++;
+  const day = new Date(Date.parse(created) + 9 * 3600_000).toISOString().slice(0, 10);
+  (agg.days ||= {})[day] = (agg.days[day] || 0) + 1;
+  if (device) (agg.dev ||= {})[device] = (agg.dev[device] || 0) + 1;
+  if (!agg.first || created < agg.first) agg.first = created;
   for (const q of s.questions) {
     const v = answers[q.id];
     if (v === undefined) continue;
@@ -299,8 +306,33 @@ async function saveResponse(env: any, s: Survey, device: string, answers: Record
   }
   const key = `agg:${s.id}`;
   const agg: Agg = (await env.NEWS_KV.get(key, 'json')) || { total: 0, q: {} };
-  addToAgg(agg, s, answers);
+  addToAgg(agg, s, answers, device, created);
   await env.NEWS_KV.put(key, JSON.stringify(agg));
+}
+
+// 保存済みの回答から集計を作り直す（日別・設置場所別の内訳がない古い集計の補完用）
+async function rebuildAgg(env: any, s: Survey): Promise<Agg> {
+  const rows = await exportResponses(env, s.id);
+  const agg: Agg = { total: 0, q: {} };
+  for (const r of [...rows].reverse()) addToAgg(agg, s, r.answers || {}, r.device || '', r.created);
+  agg.updated = new Date().toISOString();
+  await env.NEWS_KV.put(`agg:${s.id}`, JSON.stringify(agg));
+  return agg;
+}
+
+// ---------- クライアント別レポート ----------
+// レポートには回答の集計だけを載せる（クーポンコード・当選確率などの設定値は出さない）
+async function buildReport(env: any, cfg: BizConfig, client: Client) {
+  const mine = (cfg.surveys || []).filter(x => x.client === client.id);
+  const devNames: Record<string, string> = { qr: 'QRコード（スマホ）', web: 'Web' };
+  for (const dv of cfg.devices) devNames[dv.id] = dv.name;
+  const surveys = await Promise.all(mine.map(async x => {
+    const agg: Agg = (await env.NEWS_KV.get(`agg:${x.id}`, 'json')) || { total: 0, q: {} };
+    const winners = x.incentive.type === 'lottery' ? parseInt((await env.NEWS_KV.get(`lotw:${x.id}`)) || '0', 10) : undefined;
+    const { incentive, owner, ...rest } = x;
+    return { survey: { ...rest, incentive: { type: incentive.type, text: incentive.text } }, agg, winners };
+  }));
+  return { client: { name: client.name }, generatedAt: new Date().toISOString(), devices: devNames, surveys };
 }
 
 async function exportResponses(env: any, surveyId: string) {
@@ -814,7 +846,10 @@ export async function handleEngage(request: Request, env: any, ctx: any, url: UR
     if (path === '/api/owner/surveys' && request.method === 'PUT') {
       if (!features.survey) return json({ error: 'アンケートはスタンダードプランでご利用いただけます' }, 403);
       const b: any = await body();
-      const list = (Array.isArray(b?.surveys) ? b.surveys : []).slice(0, 20).map((s: any) => sanitizeSurvey(s, dev.id)).filter(Boolean) as Survey[];
+      const before = new Map((cfg.surveys || []).filter(s => s.owner === dev.id).map(s => [s.id, s.client]));
+      // クライアントの割り当ては管理者だけが変えられる
+      const list = ((Array.isArray(b?.surveys) ? b.surveys : []).slice(0, 20).map((s: any) => sanitizeSurvey(s, dev.id)).filter(Boolean) as Survey[])
+        .map(s => ({ ...s, client: before.get(s.id) }));
       cfg.surveys = [...(cfg.surveys || []).filter(s => s.owner !== dev.id), ...list];
       if (dev.surveyId && !list.some(s => s.id === dev.surveyId)) dev.surveyId = undefined;
       await saveConfig(env, cfg);
@@ -832,7 +867,20 @@ export async function handleEngage(request: Request, env: any, ctx: any, url: UR
   }
 
   // ---------- 管理API（biz.ts と同じ管理者認証） ----------
-  if (path.startsWith('/api/admin/') && ['/api/admin/survey/export', '/api/admin/survey/agg', '/api/admin/claim', '/api/admin/local/crawl', '/api/admin/quiz/generate', '/api/admin/applications', '/api/admin/applications/update', '/api/admin/applications/activate'].includes(path)) {
+  // ---------- クライアント別レポート（レポートURLのキーで閲覧） ----------
+  if (path === '/api/report' || path === '/api/report/export') {
+    const key = str(url.searchParams.get('key'), 80);
+    const cfg = await loadConfig(env);
+    const client = key.length >= 16 ? (cfg.clients || []).find(c => c.reportKey === key) : undefined;
+    if (!client) return json({ error: 'このレポートURLは無効です。発行元にお問い合わせください' }, 404);
+    const nocache = { 'Cache-Control': 'private, no-store', 'X-Robots-Tag': 'noindex' };
+    if (path === '/api/report') return json(await buildReport(env, cfg, client), 200, nocache);
+    const s = (cfg.surveys || []).find(x => x.id === str(url.searchParams.get('id'), 40) && x.client === client.id);
+    if (!s) return json({ error: 'not found' }, 404);
+    return json({ rows: await exportResponses(env, s.id) }, 200, nocache);
+  }
+
+  if (path.startsWith('/api/admin/') && ['/api/admin/survey/reagg', '/api/admin/survey/export', '/api/admin/survey/agg', '/api/admin/claim', '/api/admin/local/crawl', '/api/admin/quiz/generate', '/api/admin/applications', '/api/admin/applications/update', '/api/admin/applications/activate'].includes(path)) {
     if (!(await adminFrom(request, env))) return json({ error: 'unauthorized' }, 401);
     if (path === '/api/admin/applications') return json({ applications: await listApplications(env) });
     if (path === '/api/admin/applications/update' && request.method === 'POST') {
@@ -861,6 +909,11 @@ export async function handleEngage(request: Request, env: any, ctx: any, url: UR
       await env.NEWS_KV.put(APP_KEY(a.id), JSON.stringify(a), { expirationTtl: 3 * 365 * 86400 });
       ctx?.waitUntil?.(track(env, 'signage_contract', a.plan));
       return json({ application: a, devices: devs.map(d => ({ id: d.id, name: d.name, key: d.key, ownerKey: d.ownerKey, paidUntil: d.paidUntil })), rev: cfg.rev });
+    }
+    if (path === '/api/admin/survey/reagg' && request.method === 'POST') {
+      const s = (await loadConfig(env, true)).surveys.find(x => x.id === str(url.searchParams.get('id'), 40));
+      if (!s) return json({ error: 'not found' }, 404);
+      return json(await rebuildAgg(env, s));
     }
     if (path === '/api/admin/survey/export') return json({ rows: await exportResponses(env, str(url.searchParams.get('id'), 40)) });
     if (path === '/api/admin/survey/agg') return json((await env.NEWS_KV.get(`agg:${str(url.searchParams.get('id'), 40)}`, 'json')) || { total: 0, q: {} });
